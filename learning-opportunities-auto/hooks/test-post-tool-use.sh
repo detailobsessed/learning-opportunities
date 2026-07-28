@@ -216,6 +216,60 @@ else
   pass=$((pass + 1))  # jq unavailable; the hook itself never requires it
 fi
 
+# --- commit targeting another repo via -C: uses that repo, not cwd ---------
+# The session cwd here is a repo whose HEAD is stale, so a nudge can only
+# happen if the hook actually followed the -C into the fresh repo.
+other_repo="$TEST_TMPDIR/other"
+git init -q "$other_repo"
+git -C "$other_repo" config user.email test@example.com
+git -C "$other_repo" config user.name "Test"
+git -C "$other_repo" config commit.gpgsign false
+echo y > "$other_repo/g.txt"
+git -C "$other_repo" add g.txt
+git -C "$other_repo" commit -q -m "commit in the other repo"
+xrepo_payload=$(printf '{"session_id":"test-xrepo","cwd":"%s","tool_input":{"command":"git -C %s commit -m \\"x\\""},"tool_response":{}}' "$stale_repo" "$other_repo")
+xrepo_out=$(printf '%s' "$xrepo_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+if grep -q "commit in the other repo" <<<"$xrepo_out"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  -C redirect: expected the other repo's commit, got: $xrepo_out" >&2
+fi
+
+# --- commit targeting another repo via leading cd ---------------------------
+cd_payload=$(printf '{"session_id":"test-cdrepo","cwd":"%s","tool_input":{"command":"cd %s && git commit -m \\"x\\""},"tool_response":{}}' "$stale_repo" "$other_repo")
+cd_out=$(printf '%s' "$cd_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+if grep -q "commit in the other repo" <<<"$cd_out"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  cd redirect: expected the other repo's commit, got: $cd_out" >&2
+fi
+
+# --- commit followed by slow work still nudges -----------------------------
+# The hook fires only after the whole command finishes, so HEAD can be minutes
+# old by the time it runs. Backdate HEAD past the old 120s window but inside
+# the current one to prove a slow follow-up doesn't suppress a real commit.
+slow_repo="$TEST_TMPDIR/slow"
+git init -q "$slow_repo"
+git -C "$slow_repo" config user.email test@example.com
+git -C "$slow_repo" config user.name "Test"
+git -C "$slow_repo" config commit.gpgsign false
+echo z > "$slow_repo/h.txt"
+git -C "$slow_repo" add h.txt
+# Epoch form with an explicit zone — a bare timestamp is read as local time,
+# which silently shifts the commit by the UTC offset.
+slow_date="@$(( $(date +%s) - 300 )) +0000"
+GIT_COMMITTER_DATE="$slow_date" GIT_AUTHOR_DATE="$slow_date" \
+  git -C "$slow_repo" commit -q -m "commit then slow test run"
+slow_payload=$(printf '{"session_id":"test-slow","cwd":"%s","tool_input":{"command":"git commit -m \\"x\\" && npm test"},"tool_response":{}}' "$slow_repo")
+if printf '%s' "$slow_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null | grep -q additionalContext; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  commit + 5min of follow-up work: expected nudge, got silence" >&2
+fi
+
 # --- non-git working directory: still nudges, just without context ---------
 # Non-colocated Jujutsu repos have no .git, so failing closed here would
 # silently disable the hook for those users.

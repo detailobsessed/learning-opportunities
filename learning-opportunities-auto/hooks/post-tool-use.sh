@@ -76,12 +76,14 @@ COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:sp
 # first) means we don't depend on tool_input preceding tool_response in the
 # payload — a key order the hook contract does not guarantee.
 FOUND_COMMIT=0
+MATCHED_CMD=""
 while IFS= read -r cmd; do
   [[ -z "$cmd" ]] && continue
   # Strip leading whitespace so the `^` anchor still applies to " git commit".
   cmd="${cmd#"${cmd%%[![:space:]]*}"}"
   if echo "$cmd" | grep -Eq "$COMMIT_RE"; then
     FOUND_COMMIT=1
+    MATCHED_CMD="$cmd"
     break
   fi
 done < <(echo "$INPUT" | grep -oE '"(command|cmd)":"([^"\\]|\\.)*"' | sed -E 's/^"(command|cmd)":"//; s/"$//')
@@ -117,7 +119,31 @@ if [[ -z "$CWD" || ! -d "$CWD" ]]; then
   CWD="$PWD"
 fi
 
-SHA=$(git -C "$CWD" rev-parse --short HEAD 2>/dev/null) || SHA=""
+# The payload's cwd is the session's directory, which is not necessarily where
+# the commit landed. `git -C /other/repo commit` and `cd /other/repo &&
+# git commit` both target somewhere else, and querying the session directory
+# would then read an unrelated repository's HEAD — suppressing a real commit
+# because the wrong HEAD looks stale, or nudging with the wrong SHA.
+#
+# Redirection is read back off the command: an explicit -C (git) or -R (jj)
+# wins, since those override the working directory; otherwise a leading `cd`.
+# Relative paths resolve against the session cwd. Anything unparseable or
+# missing just leaves the session cwd in place.
+REPO_DIR="$CWD"
+redirect=$(printf '%s' "$MATCHED_CMD" \
+  | sed -nE 's/.*[[:space:]]-(C|R)[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\2/p' | head -1)
+if [[ -z "$redirect" ]]; then
+  redirect=$(printf '%s' "$MATCHED_CMD" \
+    | sed -nE 's/^cd[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\1/p' | head -1)
+fi
+if [[ -n "$redirect" ]]; then
+  redirect="${redirect%\"}"; redirect="${redirect#\"}"
+  redirect="${redirect%\'}"; redirect="${redirect#\'}"
+  [[ "$redirect" != /* ]] && redirect="$CWD/$redirect"
+  [[ -d "$redirect" ]] && REPO_DIR="$redirect"
+fi
+
+SHA=$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null) || SHA=""
 
 if [[ -n "$SHA" ]]; then
   # Confirm the commit actually landed. A rejected `git commit` — failing
@@ -127,12 +153,17 @@ if [[ -n "$SHA" ]]; then
   # `--amend` preserves) is set when the commit object is written, so a fresh
   # HEAD means the command we just saw succeeded.
   #
-  # The window is generous because it has to cover slow pre-commit hooks and
-  # large trees. The cost of being too generous is only that a commit failing
-  # within the window of a prior success still nudges — the same behavior as
-  # before this guard existed.
-  COMMIT_TS=$(git -C "$CWD" log -1 --format=%ct 2>/dev/null) || COMMIT_TS=""
-  if [[ -n "$COMMIT_TS" ]] && (( $(date +%s) - COMMIT_TS > 120 )); then
+  # The window has to be wide, because the hook fires only once the *whole*
+  # shell command finishes: `git commit -m x && npm test` can put minutes
+  # between the commit being written and this check running, and suppressing
+  # that nudge would lose exactly the learning moment the plugin exists for.
+  # A rejected commit normally leaves HEAD on work from a previous sitting,
+  # which is far older than this window, and the repeated-failure case is
+  # caught by the SHA de-dupe below regardless of timing. Erring wide trades
+  # a rare spurious nudge for not dropping real ones — the right direction
+  # for this plugin.
+  COMMIT_TS=$(git -C "$REPO_DIR" log -1 --format=%ct 2>/dev/null) || COMMIT_TS=""
+  if [[ -n "$COMMIT_TS" ]] && (( $(date +%s) - COMMIT_TS > 900 )); then
     exit 0
   fi
 fi
@@ -180,7 +211,7 @@ fi
 
 CONTEXT=""
 if [[ -n "$SHA" ]]; then
-  SUBJECT=$(git -C "$CWD" log -1 --pretty=%s 2>/dev/null \
+  SUBJECT=$(git -C "$REPO_DIR" log -1 --pretty=%s 2>/dev/null \
     | tr '[:cntrl:]' ' ' | tr -d '"\\' | cut -c1-120 \
     | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
   if [[ -n "$SUBJECT" ]]; then
