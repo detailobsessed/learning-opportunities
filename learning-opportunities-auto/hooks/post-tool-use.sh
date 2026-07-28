@@ -4,16 +4,23 @@ set -uo pipefail
 # learning-opportunities-auto: PostToolUse hook (matches Bash tool)
 #
 # Fires after every Bash tool use. Checks whether the command was a
-# `git commit` and, if so, suggests that Claude offer a learning exercise.
-# The skill itself decides whether the commit's content is worth an
-# exercise — this hook just provides the nudge at the right moment.
+# `git commit` or `jj commit` and, if so, suggests that Claude offer a
+# learning exercise. The skill itself decides whether the commit's content
+# is worth an exercise — this hook just provides the nudge at the right
+# moment.
 #
 # No external dependencies beyond bash and standard Unix tools.
 
 INPUT=$(cat)
 
 # ---------------------------------------------------------------------------
-# Check if this was a git commit.
+# Check if this was a commit.
+#
+# Both `git commit` and `jj commit` count. Jujutsu is git-compatible and in
+# its default colocated mode operates directly on a standard .git directory,
+# so `jj commit` produces a real git commit. The learning-opportunities skill
+# is VCS-agnostic anyway — the meaningful event is "the user finalized a chunk
+# of work", not which binary they typed.
 #
 # Claude Code sends shell text in a "command" field; Codex can send it in a
 # "cmd" field. The payload also carries the tool's *output* in "tool_response",
@@ -30,11 +37,11 @@ INPUT=$(cat)
 #      tool output is never scanned.
 # ---------------------------------------------------------------------------
 
-if ! echo "$INPUT" | grep -Eq '"(command|cmd)".*git.*commit'; then
+if ! echo "$INPUT" | grep -Eq '"(command|cmd)".*(git|jj).*commit'; then
   exit 0
 fi
 
-# Anchored match for a real `git commit` invocation:
+# Anchored match for a real `git commit` / `jj commit` invocation:
 #
 #   (^|[;&|`({][[:space:]]*|\$\([[:space:]]*)
 #     Start of the command, or immediately after a shell separator (`;`, `&`,
@@ -42,14 +49,15 @@ fi
 #     separator rather than mere whitespace is what rejects `git` appearing
 #     inside a quoted argument, e.g. `echo "how to git commit"`.
 #
-#   git
+#   (git|jj)
 #     The literal command name. The anchor above keeps `foogit`/`git-foo` out.
 #
 #   ([[:space:]]+-[^[:space:]"]+([[:space:]]+[^-[:space:]"][^[:space:]"]*)?)*
 #     Zero or more global-flag blocks: `-flag`, optionally followed by a value
-#     that doesn't itself start with `-`. Lets `git -C /repo commit` match
-#     while keeping `git log --grep=commit` out — `log` is not a flag, so the
-#     run of flag blocks cannot bridge it to `commit`.
+#     that doesn't itself start with `-`. Lets `git -C /repo commit` and
+#     `jj -R /repo commit` match while keeping `git log --grep=commit` and
+#     `jj log -r commit` out — `log` is not a flag, so the run of flag blocks
+#     cannot bridge it to `commit`.
 #
 #   [[:space:]]+commit
 #     The subcommand.
@@ -59,7 +67,7 @@ fi
 #     backslash escape. Keeps `git commit-tree` from matching.
 #
 # Adapted from @jasikpark's approach in DrCatHicks/learning-opportunities#15.
-COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)git([[:space:]]+-[^[:space:]"]+([[:space:]]+[^-[:space:]"][^[:space:]"]*)?)*[[:space:]]+commit([[:space:]";|&)]|$|\\)'
+COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:space:]"]+([[:space:]]+[^-[:space:]"][^[:space:]"]*)?)*[[:space:]]+commit([[:space:]";|&)]|$|\\)'
 
 # Pull out every "command"/"cmd" JSON string value. The inner
 # ([^"\\]|\\.)* consumes escaped quotes so a value like
