@@ -505,11 +505,15 @@ else
   pass=$((pass + 1))
 fi
 
-# --- Codex hook resolves the most recently installed copy ------------------
-# Runs the real command string out of the config against a fake cache holding
-# several versions, so the resolution logic is exercised rather than assumed.
-# Selection is by mtime, which is why this must not depend on `sort -V` being
-# available — that is not guaranteed across every sort implementation.
+# --- Codex hook resolves the version Codex itself considers active ---------
+# Runs the real command string out of the config against a fake cache, so the
+# resolution logic is exercised rather than assumed.
+#
+# The rule has to match Codex's own: `local` when that directory exists,
+# otherwise the highest version. Codex loads the plugin config from the
+# directory it considers active, so a hook that picks differently runs a
+# script belonging to a different install. Both cases below are built so that
+# selecting by modification time would pick the wrong one.
 if command -v jq >/dev/null 2>&1; then
   fake_home="$TEST_TMPDIR/codex"
   fake_base="$fake_home/plugins/cache/learning-opportunities/learning-opportunities-auto"
@@ -517,16 +521,32 @@ if command -v jq >/dev/null 2>&1; then
     mkdir -p "$fake_base/$v/hooks"
     printf '#!/usr/bin/env bash\necho RESOLVED-%s\n' "$v" > "$fake_base/$v/hooks/post-tool-use.sh"
   done
-  # Make 1.10.0 the most recently installed, in an order where lexicographic
-  # sorting would pick 1.9.0 instead.
-  touch "$fake_base/1.10.0/hooks/post-tool-use.sh"
   codex_cmd=$(jq -r '.hooks.PostToolUse[0].hooks[0].command' "$CODEX_HOOKS")
+
+  # Highest version wins, not the newest on disk and not the lexicographic
+  # maximum — 1.0.2 is touched last here, and 1.9.0 sorts above 1.10.0 as text.
+  touch "$fake_base/1.0.2"
   resolved=$(CODEX_HOME="$fake_home" bash -c "$codex_cmd" 2>/dev/null)
   if [[ "$resolved" == "RESOLVED-1.10.0" ]]; then
     pass=$((pass + 1))
   else
     fail=$((fail + 1))
     echo "FAIL  Codex hook resolution: expected RESOLVED-1.10.0, got '$resolved'" >&2
+  fi
+
+  # A local dev install wins over every numbered version, however old it is.
+  # 1.10.0 is touched *after* local is written — both the directory and the
+  # script inside it — so any form of recency selection would pick 1.10.0 here
+  # and this assertion can only pass by preferring local outright.
+  mkdir -p "$fake_base/local/hooks"
+  printf '#!/usr/bin/env bash\necho RESOLVED-local\n' > "$fake_base/local/hooks/post-tool-use.sh"
+  touch "$fake_base/1.10.0/hooks/post-tool-use.sh" "$fake_base/1.10.0"
+  resolved=$(CODEX_HOME="$fake_home" bash -c "$codex_cmd" 2>/dev/null)
+  if [[ "$resolved" == "RESOLVED-local" ]]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL  Codex hook resolution: expected RESOLVED-local, got '$resolved'" >&2
   fi
 
   # A missing cache must exit silently rather than erroring.
@@ -538,7 +558,7 @@ if command -v jq >/dev/null 2>&1; then
     echo "FAIL  Codex hook with no cache should exit 0" >&2
   fi
 else
-  pass=$((pass + 2))
+  pass=$((pass + 3))
 fi
 
 echo

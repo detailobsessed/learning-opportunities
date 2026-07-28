@@ -35,9 +35,9 @@ Each plugin has its own version. When releasing, update the version in four plac
 
 Use semver. All versioned files must show the same version string for the plugin being released. Commit them together.
 
-`learning-opportunities-auto/hooks.codex.json` is deliberately **not** in that list. It resolves the hook script out of Codex's plugin cache, whose path contains the installed version, by globbing and taking the most recently installed one. Do not reintroduce a hardcoded version there — it would have to be bumped in lockstep with every release, and it never matches a local dev install (cached under `local` rather than a version number). `learning-opportunities-auto/hooks/test-post-tool-use.sh` asserts this.
+`learning-opportunities-auto/hooks.codex.json` is deliberately **not** in that list. It resolves the hook script out of Codex's plugin cache, whose path contains the installed version, by globbing rather than naming a version. Do not reintroduce a hardcoded version there — it would have to be bumped in lockstep with every release, and it never matches a local dev install.
 
-Selection is by modification time (`ls -1dt`), not by parsing version numbers. The most recently installed copy is the active one, which is what should run — including a `local` dev install, which has no version to compare. It also keeps the command free of `sort -V`, so there is no dependency on version-sort support in whichever `sort` is on PATH.
+Selection mirrors how Codex itself picks the active version: `local` if that directory exists, otherwise the highest version by `sort -V`. It has to match, because Codex loads the plugin config from the directory it considers active and the hook must run the script from that same one. Do not select by modification time — a `local` dev install or a reinstall of an older release can easily be the most recently touched directory while Codex is loading a different one, and the hook then runs a script that does not belong to the active plugin.
 
 ### Changelog format
 

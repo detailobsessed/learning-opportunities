@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'base=\"${CODEX_HOME:-$HOME/.codex}/plugins/cache/learning-opportunities/learning-opportunities-auto\"; script=$(ls -1dt \"$base\"/*/hooks/post-tool-use.sh 2>/dev/null | head -1); [ -n \"$script\" ] && exec bash \"$script\" || exit 0'"
+            "command": "bash -c 'base=\"${CODEX_HOME:-$HOME/.codex}/plugins/cache/learning-opportunities/learning-opportunities-auto\"; dir=\"$base/local/\"; [ -d \"$dir\" ] || dir=$(ls -1d \"$base\"/*/ 2>/dev/null | sort -V | tail -1); script=\"${dir}hooks/post-tool-use.sh\"; [ -f \"$script\" ] && exec bash \"$script\" || exit 0'"
           }
         ]
       }
