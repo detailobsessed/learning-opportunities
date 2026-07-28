@@ -246,6 +246,36 @@ else
   echo "FAIL  cd redirect: expected the other repo's commit, got: $cd_out" >&2
 fi
 
+# --- other redirect forms: --git-dir, --work-tree, pushd, and = syntax ------
+for form in \
+  "git --git-dir=%s/.git commit -m \\\\\"x\\\\\"" \
+  "git --work-tree %s commit -m \\\\\"x\\\\\"" \
+  "pushd %s && git commit -m \\\\\"x\\\\\"" \
+  "git -C=%s commit -m \\\\\"x\\\\\""
+do
+  cmd=$(printf "$form" "$other_repo")
+  p=$(printf '{"session_id":"test-redir-%s","cwd":"%s","tool_input":{"command":"%s"},"tool_response":{}}' \
+    "$RANDOM" "$stale_repo" "$cmd")
+  out=$(printf '%s' "$p" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+  if grep -q "commit in the other repo" <<<"$out"; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL  redirect form not followed: $cmd" >&2
+  fi
+done
+
+# --- an unresolvable redirect falls back to the session cwd ----------------
+# Must not guess at a path that isn't there; the session repo stays in use.
+bogus_payload=$(printf '{"session_id":"test-bogus","cwd":"%s","tool_input":{"command":"git -C /nope/nowhere commit -m \\"x\\""},"tool_response":{}}' "$REPO")
+fresh_commit "fallback commit"
+if printf '%s' "$bogus_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null | grep -q "fallback commit"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  unresolvable redirect should fall back to the session cwd" >&2
+fi
+
 # --- commit followed by slow work still nudges -----------------------------
 # The hook fires only after the whole command finishes, so HEAD can be minutes
 # old by the time it runs. Backdate HEAD past the old 120s window but inside

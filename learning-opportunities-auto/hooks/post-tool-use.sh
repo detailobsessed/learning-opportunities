@@ -130,16 +130,42 @@ fi
 # Relative paths resolve against the session cwd. Anything unparseable or
 # missing just leaves the session cwd in place.
 REPO_DIR="$CWD"
-redirect=$(printf '%s' "$MATCHED_CMD" \
-  | sed -nE 's/.*[[:space:]]-(C|R)[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\2/p' | head -1)
+
+# Value of an option in the matched command, accepting either `--opt value` or
+# `--opt=value`, and single- or double-quoted values.
+opt_value() {
+  printf '%s' "$MATCHED_CMD" \
+    | sed -nE "s/.*[[:space:]]-{1,2}($1)[=[:space:]][[:space:]]*(\"[^\"]*\"|'[^']*'|[^[:space:]]+).*/\2/p" \
+    | head -1
+}
+
+# Most specific wins. --work-tree names the working tree outright; --git-dir
+# names the repository directory, whose parent is the working tree in a
+# conventional layout; -C (git) and -R (jj) change where the command looks;
+# a leading cd or pushd moves the shell before any of it runs.
+redirect=$(opt_value 'work-tree')
+if [[ -z "$redirect" ]]; then
+  gitdir=$(opt_value 'git-dir')
+  if [[ -n "$gitdir" ]]; then
+    gitdir="${gitdir%\"}"; gitdir="${gitdir#\"}"
+    gitdir="${gitdir%\'}"; gitdir="${gitdir#\'}"
+    # /path/to/repo/.git -> /path/to/repo
+    redirect="${gitdir%/.git}"
+    [[ "$redirect" == "$gitdir" && "$(basename "$gitdir")" == ".git" ]] && redirect=$(dirname "$gitdir")
+  fi
+fi
+if [[ -z "$redirect" ]]; then
+  redirect=$(opt_value 'C|R')
+fi
 if [[ -z "$redirect" ]]; then
   redirect=$(printf '%s' "$MATCHED_CMD" \
-    | sed -nE 's/^cd[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\1/p' | head -1)
+    | sed -nE 's/^(cd|pushd)[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\2/p' | head -1)
 fi
 if [[ -n "$redirect" ]]; then
   redirect="${redirect%\"}"; redirect="${redirect#\"}"
   redirect="${redirect%\'}"; redirect="${redirect#\'}"
   [[ "$redirect" != /* ]] && redirect="$CWD/$redirect"
+  # An unresolvable path leaves the session cwd in place rather than guessing.
   [[ -d "$redirect" ]] && REPO_DIR="$redirect"
 fi
 
