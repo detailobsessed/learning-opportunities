@@ -52,12 +52,17 @@ fi
 #   (git|jj)
 #     The literal command name. The anchor above keeps `foogit`/`git-foo` out.
 #
-#   ([[:space:]]+-[^[:space:]"]+([[:space:]]+[^-[:space:]"][^[:space:]"]*)?)*
+#   ([[:space:]]+-[^[:space:]"]+("[^"]*"|'[^']*')?([[:space:]]+("[^"]*"|'[^']*'|[^-[:space:]"][^[:space:]"]*))?)*
 #     Zero or more global-flag blocks: `-flag`, optionally followed by a value
 #     that doesn't itself start with `-`. Lets `git -C /repo commit` and
 #     `jj -R /repo commit` match while keeping `git log --grep=commit` and
 #     `jj log -r commit` out — `log` is not a flag, so the run of flag blocks
 #     cannot bridge it to `commit`.
+#
+#     A value may be quoted, in both the `--opt "value"` and `--opt="value"`
+#     positions, because a path that might contain a space usually is quoted.
+#     Without those alternatives the quote terminates the flag block and
+#     `git -C "/other repo" commit` is not recognized as a commit at all.
 #
 #   [[:space:]]+commit
 #     The subcommand.
@@ -67,7 +72,7 @@ fi
 #     backslash escape. Keeps `git commit-tree` from matching.
 #
 # Adapted from @jasikpark's approach in DrCatHicks/learning-opportunities#15.
-COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:space:]"]+([[:space:]]+[^-[:space:]"][^[:space:]"]*)?)*[[:space:]]+commit([[:space:]";|&)]|$|\\)'
+COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:space:]"]+("[^"]*"|'"'"'[^'"'"']*'"'"')?([[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^-[:space:]"][^[:space:]"]*))?)*[[:space:]]+commit([[:space:]";|&)]|$|\\)'
 
 # Pull out every "command"/"cmd" JSON string value. The inner
 # ([^"\\]|\\.)* consumes escaped quotes so a value like
@@ -79,6 +84,19 @@ FOUND_COMMIT=0
 MATCHED_CMD=""
 while IFS= read -r cmd; do
   [[ -z "$cmd" ]] && continue
+  # The payload is JSON, so the command arrives escaped: a quoted path written
+  # `git -C "/other repo" commit` reaches us as `git -C \"/other repo\" commit`.
+  # Undo that here, once, so neither the pattern above nor the redirect parsing
+  # further down has to reason about backslashes — left escaped, the quotes
+  # defeat both, and the hook silently falls back to the session cwd.
+  #
+  # `\\` is folded to a sentinel first so an escaped backslash sitting right
+  # before a quote (`...\\"`) isn't misread as an escaped quote. Other JSON
+  # escapes are left alone: \n and \t are not part of a path, and turning them
+  # into real control characters would only give the parsing more to trip on.
+  cmd="${cmd//\\\\/$'\001'}"
+  cmd="${cmd//\\\"/\"}"
+  cmd="${cmd//$'\001'/\\}"
   # Strip leading whitespace so the `^` anchor still applies to " git commit".
   cmd="${cmd#"${cmd%%[![:space:]]*}"}"
   if echo "$cmd" | grep -Eq "$COMMIT_RE"; then
@@ -131,6 +149,9 @@ fi
 # missing just leaves the session cwd in place.
 REPO_DIR="$CWD"
 
+# MATCHED_CMD was JSON-unescaped when it was extracted, so quoting here is
+# ordinary shell quoting.
+#
 # Value of an option in the matched command, accepting either `--opt value` or
 # `--opt=value`, and single- or double-quoted values.
 opt_value() {
@@ -139,37 +160,49 @@ opt_value() {
     | head -1
 }
 
-# Most specific wins. --work-tree names the working tree outright; --git-dir
-# names the repository directory, whose parent is the working tree in a
-# conventional layout; -C (git) and -R (jj) change where the command looks;
-# a leading cd or pushd moves the shell before any of it runs.
-redirect=$(opt_value 'work-tree')
-if [[ -z "$redirect" ]]; then
-  gitdir=$(opt_value 'git-dir')
-  if [[ -n "$gitdir" ]]; then
-    gitdir="${gitdir%\"}"; gitdir="${gitdir#\"}"
-    gitdir="${gitdir%\'}"; gitdir="${gitdir#\'}"
-    # /path/to/repo/.git -> /path/to/repo
-    redirect="${gitdir%/.git}"
-    [[ "$redirect" == "$gitdir" && "$(basename "$gitdir")" == ".git" ]] && redirect=$(dirname "$gitdir")
+# Strip one layer of quoting and resolve a relative path against the session
+# cwd, which is where the shell would have resolved it.
+unquote_path() {
+  local v="$1"
+  v="${v%\"}"; v="${v#\"}"
+  v="${v%\'}"; v="${v#\'}"
+  [[ -n "$v" && "$v" != /* ]] && v="$CWD/$v"
+  printf '%s' "$v"
+}
+
+# How to point git at the repository the commit actually landed in.
+#
+# --git-dir and --work-tree are passed straight through rather than collapsed
+# into a single directory: they are independent in an out-of-tree or bare
+# layout (`git --git-dir=/srv/meta/project.git --work-tree=/srv/work commit`),
+# and keeping only one of them would send the queries below to a directory
+# that is not a repository at all. Otherwise the working directory is enough:
+# -C (git) and -R (jj) change where the command looks, and a leading cd or
+# pushd moves the shell before any of it runs.
+#
+# GIT_LOC is always non-empty — expanding an empty array under `set -u` is an
+# error in the bash 3.2 that ships with macOS.
+WORK_TREE=$(unquote_path "$(opt_value 'work-tree')")
+GIT_DIR_OPT=$(unquote_path "$(opt_value 'git-dir')")
+
+if [[ -n "$GIT_DIR_OPT" && -e "$GIT_DIR_OPT" ]]; then
+  GIT_LOC=(--git-dir "$GIT_DIR_OPT")
+  [[ -n "$WORK_TREE" && -d "$WORK_TREE" ]] && GIT_LOC+=(--work-tree "$WORK_TREE")
+elif [[ -n "$WORK_TREE" && -d "$WORK_TREE" ]]; then
+  GIT_LOC=(-C "$WORK_TREE")
+else
+  redirect=$(unquote_path "$(opt_value 'C|R')")
+  if [[ -z "$redirect" ]]; then
+    redirect=$(printf '%s' "$MATCHED_CMD" \
+      | sed -nE 's/^(cd|pushd)[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\2/p' | head -1)
+    redirect=$(unquote_path "$redirect")
   fi
-fi
-if [[ -z "$redirect" ]]; then
-  redirect=$(opt_value 'C|R')
-fi
-if [[ -z "$redirect" ]]; then
-  redirect=$(printf '%s' "$MATCHED_CMD" \
-    | sed -nE 's/^(cd|pushd)[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\2/p' | head -1)
-fi
-if [[ -n "$redirect" ]]; then
-  redirect="${redirect%\"}"; redirect="${redirect#\"}"
-  redirect="${redirect%\'}"; redirect="${redirect#\'}"
-  [[ "$redirect" != /* ]] && redirect="$CWD/$redirect"
   # An unresolvable path leaves the session cwd in place rather than guessing.
-  [[ -d "$redirect" ]] && REPO_DIR="$redirect"
+  [[ -n "$redirect" && -d "$redirect" ]] && REPO_DIR="$redirect"
+  GIT_LOC=(-C "$REPO_DIR")
 fi
 
-SHA=$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null) || SHA=""
+SHA=$(git "${GIT_LOC[@]}" rev-parse --short HEAD 2>/dev/null) || SHA=""
 
 if [[ -n "$SHA" ]]; then
   # Confirm the commit actually landed. A rejected `git commit` — failing
@@ -188,7 +221,7 @@ if [[ -n "$SHA" ]]; then
   # caught by the SHA de-dupe below regardless of timing. Erring wide trades
   # a rare spurious nudge for not dropping real ones — the right direction
   # for this plugin.
-  COMMIT_TS=$(git -C "$REPO_DIR" log -1 --format=%ct 2>/dev/null) || COMMIT_TS=""
+  COMMIT_TS=$(git "${GIT_LOC[@]}" log -1 --format=%ct 2>/dev/null) || COMMIT_TS=""
   if [[ -n "$COMMIT_TS" ]] && (( $(date +%s) - COMMIT_TS > 900 )); then
     exit 0
   fi
@@ -263,7 +296,7 @@ fi
 
 CONTEXT=""
 if [[ -n "$SHA" ]]; then
-  SUBJECT=$(git -C "$REPO_DIR" log -1 --pretty=%s 2>/dev/null \
+  SUBJECT=$(git "${GIT_LOC[@]}" log -1 --pretty=%s 2>/dev/null \
     | tr '[:cntrl:]' ' ' | tr -d '"\\' | cut -c1-120 \
     | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
   if [[ -n "$SUBJECT" ]]; then
