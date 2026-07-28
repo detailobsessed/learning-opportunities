@@ -70,6 +70,22 @@ assert nudge 'git -c user.name=Test commit -m "msg"'
 assert nudge '$(git commit -m "msg")'
 assert nudge '  git commit -m "leading whitespace"'
 
+# --- jj (Jujutsu) commits: must nudge --------------------------------------
+assert nudge 'jj commit'
+assert nudge 'jj commit -m "add feature"'
+assert nudge 'jj commit; echo done'
+assert nudge '(jj commit -m "msg")'
+assert nudge 'jj commit -m "msg" | tee log'
+assert nudge 'jj -R /some/repo commit -m "msg"'
+assert nudge 'cd /some/repo && jj commit -m "wip"'
+
+# --- jj non-commits: must stay silent --------------------------------------
+assert silent 'jj log -r commit'
+assert silent 'jj describe -m "say commit"'
+assert silent 'jj status' 'Working copy changes: nothing to commit'
+assert silent 'grep -rn "jj commit" docs/'
+assert silent 'jj commit-something'
+
 # --- tool output mentioning commits: must stay silent ----------------------
 # These are the regressions: the payload's tool_response used to be scanned
 # alongside the command, so ordinary read-only git calls reported a commit.

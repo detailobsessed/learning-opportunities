@@ -6,7 +6,7 @@ A companion plugin for [learning-opportunities](../learning-opportunities/) that
 
 ## How It Works
 
-The hook fires after every `Bash` tool use and checks whether the command was a `git commit`. After a successful commit, it nudges Claude to consider whether the work that was just committed is a good fit for a learning exercise — the `learning-opportunities` skill handles deciding what kind of exercise to offer based on the nature of the changes.
+The hook fires after every `Bash` tool use and checks whether the command was a `git commit` or a `jj commit` ([Jujutsu](https://github.com/jj-vcs/jj), which in its default colocated mode writes real commits to the underlying `.git` directory). After a successful commit, it nudges Claude to consider whether the work that was just committed is a good fit for a learning exercise — the `learning-opportunities` skill handles deciding what kind of exercise to offer based on the nature of the changes.
 
 It respects the same session limits as the skill: no more than 2 offers per session, and it stops if the user declines.
 
