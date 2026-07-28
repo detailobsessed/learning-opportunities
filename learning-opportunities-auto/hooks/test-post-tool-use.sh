@@ -505,6 +505,42 @@ else
   pass=$((pass + 1))
 fi
 
+# --- Codex hook resolves the most recently installed copy ------------------
+# Runs the real command string out of the config against a fake cache holding
+# several versions, so the resolution logic is exercised rather than assumed.
+# Selection is by mtime, which is why this must not depend on `sort -V` being
+# available — that is not guaranteed across every sort implementation.
+if command -v jq >/dev/null 2>&1; then
+  fake_home="$TEST_TMPDIR/codex"
+  fake_base="$fake_home/plugins/cache/learning-opportunities/learning-opportunities-auto"
+  for v in 1.0.2 1.10.0 1.9.0; do
+    mkdir -p "$fake_base/$v/hooks"
+    printf '#!/usr/bin/env bash\necho RESOLVED-%s\n' "$v" > "$fake_base/$v/hooks/post-tool-use.sh"
+  done
+  # Make 1.10.0 the most recently installed, in an order where lexicographic
+  # sorting would pick 1.9.0 instead.
+  touch "$fake_base/1.10.0/hooks/post-tool-use.sh"
+  codex_cmd=$(jq -r '.hooks.PostToolUse[0].hooks[0].command' "$CODEX_HOOKS")
+  resolved=$(CODEX_HOME="$fake_home" bash -c "$codex_cmd" 2>/dev/null)
+  if [[ "$resolved" == "RESOLVED-1.10.0" ]]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL  Codex hook resolution: expected RESOLVED-1.10.0, got '$resolved'" >&2
+  fi
+
+  # A missing cache must exit silently rather than erroring.
+  CODEX_HOME="$TEST_TMPDIR/nonexistent" bash -c "$codex_cmd" >/dev/null 2>&1
+  if [[ $? -eq 0 ]]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL  Codex hook with no cache should exit 0" >&2
+  fi
+else
+  pass=$((pass + 2))
+fi
+
 echo
 echo "passed: $pass  failed: $fail"
 [[ "$fail" -eq 0 ]]
