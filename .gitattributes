@@ -1,0 +1,20 @@
+# Fork-local merge policy.
+#
+# README.md is intentionally rewritten in this fork to describe the fork
+# itself and point at upstream for the full documentation. It will therefore
+# never agree with upstream's README, and every `git merge upstream/main`
+# that touches it would stop on a conflict whose resolution is always
+# "keep ours".
+#
+# The `ours` merge driver makes that automatic. It is NOT built in — each
+# clone must enable it once:
+#
+#     git config merge.ours.driver true
+#
+# Without that config git falls back to a normal conflict, so forgetting it
+# is safe, just noisier.
+#
+# Note this file is committed only on this fork's main. Topic branches that
+# get proposed upstream branch from the pre-fork history and never carry it,
+# so upstream PRs stay free of fork-local policy.
+README.md merge=ours
