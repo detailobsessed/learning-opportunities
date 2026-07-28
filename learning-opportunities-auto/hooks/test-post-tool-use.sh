@@ -481,6 +481,30 @@ else
   echo "FAIL  100 KB payload took ${elapsed}s (expected <=5s)" >&2
 fi
 
+# --- Codex hook path must not pin a plugin version -------------------------
+# The Codex hook resolves this script out of Codex's plugin cache, whose path
+# contains the installed version. Hardcoding that version means every release
+# silently disables the hook until the string is bumped in lockstep, and it
+# never matches a local dev install (cached under "local", not a version).
+CODEX_HOOKS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hooks.codex.json"
+if grep -Eq '/learning-opportunities-auto/[0-9]+\.[0-9]+\.[0-9]+/' "$CODEX_HOOKS"; then
+  fail=$((fail + 1))
+  echo "FAIL  hooks.codex.json pins a plugin version in the cache path" >&2
+else
+  pass=$((pass + 1))
+fi
+
+if command -v jq >/dev/null 2>&1; then
+  if jq -e . >/dev/null 2>&1 < "$CODEX_HOOKS"; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL  hooks.codex.json is not valid JSON" >&2
+  fi
+else
+  pass=$((pass + 1))
+fi
+
 echo
 echo "passed: $pass  failed: $fail"
 [[ "$fail" -eq 0 ]]

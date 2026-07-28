@@ -35,6 +35,8 @@ Each plugin has its own version. When releasing, update the version in four plac
 
 Use semver. All versioned files must show the same version string for the plugin being released. Commit them together.
 
+`learning-opportunities-auto/hooks.codex.json` is deliberately **not** in that list. It resolves the hook script out of Codex's plugin cache, whose path contains the installed version, and does so by globbing for the highest version present. Do not reintroduce a hardcoded version there — it would have to be bumped in lockstep with every release, and it never matches a local dev install (cached under `local` rather than a version number). `learning-opportunities-auto/hooks/test-post-tool-use.sh` asserts this.
+
 ### Changelog format
 
 ```markdown
