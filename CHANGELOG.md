@@ -1,5 +1,10 @@
 # Changelog
 
+## learning-opportunities-auto 1.1.1
+
+**Fixed:**
+- The Claude Code hook expanded `${CLAUDE_PLUGIN_ROOT}` unquoted, so a plugin installed under a path containing a space word-split and the hook never ran — exit 127, with nothing to indicate why. Windows is where this bites, `C:\Users\First Last\` being the ordinary shape there. Reported upstream as [#18](https://github.com/DrCatHicks/learning-opportunities/issues/18), where it was attributed to Claude Code not expanding the variable; it does expand it, and the failure is the missing quotes. An unset `CLAUDE_PLUGIN_ROOT` now exits quietly rather than erroring on every Bash call
+
 ## learning-opportunities-auto 1.1.0
 
 Commit detection accuracy, Jujutsu support, and a more precise nudge.
