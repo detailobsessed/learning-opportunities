@@ -13,13 +13,72 @@ set -uo pipefail
 INPUT=$(cat)
 
 # ---------------------------------------------------------------------------
-# Check if this was a git commit. Claude Code sends shell text in a "command"
-# field; Codex can send it in a "cmd" field. False positives (e.g., output
-# that mentions "git commit") are harmless — we just offer a learning exercise
-# unnecessarily.
+# Check if this was a git commit.
+#
+# Claude Code sends shell text in a "command" field; Codex can send it in a
+# "cmd" field. The payload also carries the tool's *output* in "tool_response",
+# so matching against the whole payload conflates the two: `git status` prints
+# "nothing to commit", `git log` prints "commit <sha>", and both used to be
+# reported to the model as "the user just committed code".
+#
+# Two stages:
+#   1. A cheap superset grep over the raw payload as a fast early exit. Any
+#      real commit necessarily contains this pattern, so a non-match means we
+#      can bail immediately without doing the more expensive extraction. This
+#      keeps the hot path (every Bash call that isn't a commit) fast.
+#   2. Extract each "command"/"cmd" string value and test it on its own, so
+#      tool output is never scanned.
 # ---------------------------------------------------------------------------
 
 if ! echo "$INPUT" | grep -Eq '"(command|cmd)".*git.*commit'; then
+  exit 0
+fi
+
+# Anchored match for a real `git commit` invocation:
+#
+#   (^|[;&|`({][[:space:]]*|\$\([[:space:]]*)
+#     Start of the command, or immediately after a shell separator (`;`, `&`,
+#     `|`, backtick, `(`, `{`) or a `$(` command substitution. Requiring a
+#     separator rather than mere whitespace is what rejects `git` appearing
+#     inside a quoted argument, e.g. `echo "how to git commit"`.
+#
+#   git
+#     The literal command name. The anchor above keeps `foogit`/`git-foo` out.
+#
+#   ([[:space:]]+-[^[:space:]"]+([[:space:]]+[^-[:space:]"][^[:space:]"]*)?)*
+#     Zero or more global-flag blocks: `-flag`, optionally followed by a value
+#     that doesn't itself start with `-`. Lets `git -C /repo commit` match
+#     while keeping `git log --grep=commit` out — `log` is not a flag, so the
+#     run of flag blocks cannot bridge it to `commit`.
+#
+#   [[:space:]]+commit
+#     The subcommand.
+#
+#   ([[:space:]";|&)]|$|\\)
+#     Terminator: whitespace, quote, separator, end of string, or a JSON
+#     backslash escape. Keeps `git commit-tree` from matching.
+#
+# Adapted from @jasikpark's approach in DrCatHicks/learning-opportunities#15.
+COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)git([[:space:]]+-[^[:space:]"]+([[:space:]]+[^-[:space:]"][^[:space:]"]*)?)*[[:space:]]+commit([[:space:]";|&)]|$|\\)'
+
+# Pull out every "command"/"cmd" JSON string value. The inner
+# ([^"\\]|\\.)* consumes escaped quotes so a value like
+# "git commit -m \"msg\"" is captured whole rather than truncated at the
+# first inner quote. Testing every extracted value (rather than only the
+# first) means we don't depend on tool_input preceding tool_response in the
+# payload — a key order the hook contract does not guarantee.
+FOUND_COMMIT=0
+while IFS= read -r cmd; do
+  [[ -z "$cmd" ]] && continue
+  # Strip leading whitespace so the `^` anchor still applies to " git commit".
+  cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+  if echo "$cmd" | grep -Eq "$COMMIT_RE"; then
+    FOUND_COMMIT=1
+    break
+  fi
+done < <(echo "$INPUT" | grep -oE '"(command|cmd)":"([^"\\]|\\.)*"' | sed -E 's/^"(command|cmd)":"//; s/"$//')
+
+if [[ "$FOUND_COMMIT" -eq 0 ]]; then
   exit 0
 fi
 
