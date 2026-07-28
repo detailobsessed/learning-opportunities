@@ -283,6 +283,62 @@ else
   echo "FAIL  non-git cwd: expected nudge without context, got silence" >&2
 fi
 
+# --- concurrency: parallel hooks for one commit emit exactly one nudge -----
+# Tool calls can run in parallel, so the read-check-write across the state
+# files is genuinely reachable from two processes at once.
+fresh_commit "concurrent commit"
+conc_payload=$(printf '{"session_id":"test-conc","cwd":"%s","tool_input":{"command":"git commit -m \\"x\\""},"tool_response":{}}' "$REPO")
+conc_out="$TEST_TMPDIR/conc"; mkdir -p "$conc_out"
+for i in 1 2 3 4 5 6; do
+  ( printf '%s' "$conc_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null > "$conc_out/$i" ) &
+done
+wait
+conc_nudges=$(grep -l additionalContext "$conc_out"/* 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$conc_nudges" -eq 1 ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  concurrency: expected 1 nudge from 6 parallel hooks on one commit, got $conc_nudges" >&2
+fi
+
+# --- concurrency: parallel distinct commits never exceed the session cap ----
+conc2_out="$TEST_TMPDIR/conc2"; mkdir -p "$conc2_out"
+for i in 1 2 3 4 5 6; do
+  fresh_commit "parallel cap commit $i"
+  p=$(printf '{"session_id":"test-conc2","cwd":"%s","tool_input":{"command":"git commit -m \\"x\\""},"tool_response":{}}' "$REPO")
+  ( printf '%s' "$p" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null > "$conc2_out/$i" ) &
+done
+wait
+conc2_nudges=$(grep -l additionalContext "$conc2_out"/* 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$conc2_nudges" -le 2 ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  concurrency: session cap exceeded, got $conc2_nudges nudges (max 2)" >&2
+fi
+
+# --- an orphaned lock is reclaimed, not treated as permanent ---------------
+fresh_commit "after stale lock"
+stale_lock="$TEST_TMPDIR/lo_auto_test-stalelock.lock"
+mkdir -p "$stale_lock"
+touch -t 202001010000 "$stale_lock" 2>/dev/null
+lock_payload=$(printf '{"session_id":"test-stalelock","cwd":"%s","tool_input":{"command":"git commit -m \\"x\\""},"tool_response":{}}' "$REPO")
+if printf '%s' "$lock_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null | grep -q additionalContext; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  stale lock: expected the orphaned lock to be reclaimed and a nudge emitted" >&2
+fi
+
+# --- the lock is released on early-exit paths too --------------------------
+printf '%s' "$conc_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" >/dev/null 2>&1
+if [[ ! -d "$TEST_TMPDIR/lo_auto_test-conc.lock" ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  lock leaked after an early exit" >&2
+fi
+
 # --- performance guard: a large payload must not stall the hot path --------
 # A 100 KB heredoc is an ordinary Bash call. The hook fires on every one of
 # them, so detection has to stay cheap regardless of command size.

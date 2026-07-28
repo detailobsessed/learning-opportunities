@@ -185,6 +185,32 @@ fi
 SAFE_ID="${SESSION_ID//[^a-zA-Z0-9_-]/_}"
 STATE_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.state"
 SEEN_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.seen"
+LOCK_DIR="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.lock"
+
+# Both files are read, tested, and then written, so concurrent hooks in one
+# session would otherwise interleave: two could clear the de-dupe check for
+# the same SHA before either records it, and two could read the same offer
+# count and each write count+1, losing an increment and overrunning the cap.
+# Tool calls do run in parallel, so this is reachable — committing in two
+# repositories at once is enough.
+#
+# mkdir is the lock because it is atomic on POSIX and needs nothing that
+# isn't already assumed here. flock would be the conventional choice but is
+# util-linux, absent on stock macOS, and this hook ships to both.
+#
+# Losing the race means staying silent rather than waiting. Contention here
+# means another commit in the same session is being handled right now, so at
+# worst one nudge is skipped in a situation already near the session cap —
+# cheaper than making every commit wait on a lock.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  # Reclaim a lock orphaned by a process that died before releasing it,
+  # then take one more shot.
+  if [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+    rmdir "$LOCK_DIR" 2>/dev/null
+  fi
+  mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
 if [[ -n "$SHA" && -f "$SEEN_FILE" ]] && grep -qxF "$SHA" "$SEEN_FILE" 2>/dev/null; then
   exit 0
