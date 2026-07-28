@@ -52,12 +52,17 @@ fi
 #   (git|jj)
 #     The literal command name. The anchor above keeps `foogit`/`git-foo` out.
 #
-#   ([[:space:]]+-[^[:space:]"]+([[:space:]]+[^-[:space:]"][^[:space:]"]*)?)*
+#   ([[:space:]]+-[^[:space:]"]+("[^"]*"|'[^']*')?([[:space:]]+("[^"]*"|'[^']*'|[^-[:space:]"][^[:space:]"]*))?)*
 #     Zero or more global-flag blocks: `-flag`, optionally followed by a value
 #     that doesn't itself start with `-`. Lets `git -C /repo commit` and
 #     `jj -R /repo commit` match while keeping `git log --grep=commit` and
 #     `jj log -r commit` out — `log` is not a flag, so the run of flag blocks
 #     cannot bridge it to `commit`.
+#
+#     A value may be quoted, in both the `--opt "value"` and `--opt="value"`
+#     positions, because a path that might contain a space usually is quoted.
+#     Without those alternatives the quote terminates the flag block and
+#     `git -C "/other repo" commit` is not recognized as a commit at all.
 #
 #   [[:space:]]+commit
 #     The subcommand.
@@ -67,7 +72,7 @@ fi
 #     backslash escape. Keeps `git commit-tree` from matching.
 #
 # Adapted from @jasikpark's approach in DrCatHicks/learning-opportunities#15.
-COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:space:]"]+([[:space:]]+[^-[:space:]"][^[:space:]"]*)?)*[[:space:]]+commit([[:space:]";|&)]|$|\\)'
+COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:space:]"]+("[^"]*"|'"'"'[^'"'"']*'"'"')?([[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^-[:space:]"][^[:space:]"]*))?)*[[:space:]]+commit([[:space:]";|&)]|$|\\)'
 
 # Pull out every "command"/"cmd" JSON string value. The inner
 # ([^"\\]|\\.)* consumes escaped quotes so a value like
@@ -76,12 +81,27 @@ COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:sp
 # first) means we don't depend on tool_input preceding tool_response in the
 # payload — a key order the hook contract does not guarantee.
 FOUND_COMMIT=0
+MATCHED_CMD=""
 while IFS= read -r cmd; do
   [[ -z "$cmd" ]] && continue
+  # The payload is JSON, so the command arrives escaped: a quoted path written
+  # `git -C "/other repo" commit` reaches us as `git -C \"/other repo\" commit`.
+  # Undo that here, once, so neither the pattern above nor the redirect parsing
+  # further down has to reason about backslashes — left escaped, the quotes
+  # defeat both, and the hook silently falls back to the session cwd.
+  #
+  # `\\` is folded to a sentinel first so an escaped backslash sitting right
+  # before a quote (`...\\"`) isn't misread as an escaped quote. Other JSON
+  # escapes are left alone: \n and \t are not part of a path, and turning them
+  # into real control characters would only give the parsing more to trip on.
+  cmd="${cmd//\\\\/$'\001'}"
+  cmd="${cmd//\\\"/\"}"
+  cmd="${cmd//$'\001'/\\}"
   # Strip leading whitespace so the `^` anchor still applies to " git commit".
   cmd="${cmd#"${cmd%%[![:space:]]*}"}"
   if echo "$cmd" | grep -Eq "$COMMIT_RE"; then
     FOUND_COMMIT=1
+    MATCHED_CMD="$cmd"
     break
   fi
 done < <(echo "$INPUT" | grep -oE '"(command|cmd)":"([^"\\]|\\.)*"' | sed -E 's/^"(command|cmd)":"//; s/"$//')
@@ -102,33 +122,204 @@ if [[ -z "$SESSION_ID" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Session state: track how many exercises have been offered this session.
-# Uses a temp file keyed on session ID; resets when the session ends.
+# Identify the commit, if we can.
+#
+# Everything in this block is best-effort. A colocated Jujutsu repo has a
+# real .git directory and answers these queries, but a non-colocated one does
+# not, and neither does a repo we can't resolve a working directory for. In
+# those cases we fall through with an empty SHA and still nudge — just
+# without the extra precision below. Failing closed here would silently
+# disable the hook for those users.
 # ---------------------------------------------------------------------------
 
-STATE_FILE="${TMPDIR:-/tmp}/lo_auto_${SESSION_ID//[^a-zA-Z0-9_-]/_}.state"
+CWD=$(echo "$INPUT" | grep -o '"cwd":"[^"]*"' | head -1 | sed 's/"cwd":"//;s/"$//')
+if [[ -z "$CWD" || ! -d "$CWD" ]]; then
+  CWD="$PWD"
+fi
+
+# The payload's cwd is the session's directory, which is not necessarily where
+# the commit landed. `git -C /other/repo commit` and `cd /other/repo &&
+# git commit` both target somewhere else, and querying the session directory
+# would then read an unrelated repository's HEAD — suppressing a real commit
+# because the wrong HEAD looks stale, or nudging with the wrong SHA.
+#
+# Redirection is read back off the command: an explicit -C (git) or -R (jj)
+# wins, since those override the working directory; otherwise a leading `cd`.
+# Relative paths resolve against the session cwd. Anything unparseable or
+# missing just leaves the session cwd in place.
+REPO_DIR="$CWD"
+
+# MATCHED_CMD was JSON-unescaped when it was extracted, so quoting here is
+# ordinary shell quoting.
+#
+# Value of an option in the matched command, accepting either `--opt value` or
+# `--opt=value`, and single- or double-quoted values.
+opt_value() {
+  printf '%s' "$MATCHED_CMD" \
+    | sed -nE "s/.*[[:space:]]-{1,2}($1)[=[:space:]][[:space:]]*(\"[^\"]*\"|'[^']*'|[^[:space:]]+).*/\2/p" \
+    | head -1
+}
+
+# Strip one layer of quoting and resolve a relative path against the session
+# cwd, which is where the shell would have resolved it.
+unquote_path() {
+  local v="$1"
+  v="${v%\"}"; v="${v#\"}"
+  v="${v%\'}"; v="${v#\'}"
+  [[ -n "$v" && "$v" != /* ]] && v="$CWD/$v"
+  printf '%s' "$v"
+}
+
+# How to point git at the repository the commit actually landed in.
+#
+# --git-dir and --work-tree are passed straight through rather than collapsed
+# into a single directory: they are independent in an out-of-tree or bare
+# layout (`git --git-dir=/srv/meta/project.git --work-tree=/srv/work commit`),
+# and keeping only one of them would send the queries below to a directory
+# that is not a repository at all. Otherwise the working directory is enough:
+# -C (git) and -R (jj) change where the command looks, and a leading cd or
+# pushd moves the shell before any of it runs.
+#
+# GIT_LOC is always non-empty — expanding an empty array under `set -u` is an
+# error in the bash 3.2 that ships with macOS.
+WORK_TREE=$(unquote_path "$(opt_value 'work-tree')")
+GIT_DIR_OPT=$(unquote_path "$(opt_value 'git-dir')")
+
+if [[ -n "$GIT_DIR_OPT" && -e "$GIT_DIR_OPT" ]]; then
+  GIT_LOC=(--git-dir "$GIT_DIR_OPT")
+  [[ -n "$WORK_TREE" && -d "$WORK_TREE" ]] && GIT_LOC+=(--work-tree "$WORK_TREE")
+elif [[ -n "$WORK_TREE" && -d "$WORK_TREE" ]]; then
+  GIT_LOC=(-C "$WORK_TREE")
+else
+  redirect=$(unquote_path "$(opt_value 'C|R')")
+  if [[ -z "$redirect" ]]; then
+    redirect=$(printf '%s' "$MATCHED_CMD" \
+      | sed -nE 's/^(cd|pushd)[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\2/p' | head -1)
+    redirect=$(unquote_path "$redirect")
+  fi
+  # An unresolvable path leaves the session cwd in place rather than guessing.
+  [[ -n "$redirect" && -d "$redirect" ]] && REPO_DIR="$redirect"
+  GIT_LOC=(-C "$REPO_DIR")
+fi
+
+SHA=$(git "${GIT_LOC[@]}" rev-parse --short HEAD 2>/dev/null) || SHA=""
+
+if [[ -n "$SHA" ]]; then
+  # Confirm the commit actually landed. A rejected `git commit` — failing
+  # pre-commit hook, nothing staged, empty message — leaves HEAD pointing at
+  # the *previous* commit, and nudging about already-finished work is worse
+  # than staying quiet. The committer date (%ct, not the author date, which
+  # `--amend` preserves) is set when the commit object is written, so a fresh
+  # HEAD means the command we just saw succeeded.
+  #
+  # The window has to be wide, because the hook fires only once the *whole*
+  # shell command finishes: `git commit -m x && npm test` can put minutes
+  # between the commit being written and this check running, and suppressing
+  # that nudge would lose exactly the learning moment the plugin exists for.
+  # A rejected commit normally leaves HEAD on work from a previous sitting,
+  # which is far older than this window, and the repeated-failure case is
+  # caught by the SHA de-dupe below regardless of timing. Erring wide trades
+  # a rare spurious nudge for not dropping real ones — the right direction
+  # for this plugin.
+  COMMIT_TS=$(git "${GIT_LOC[@]}" log -1 --format=%ct 2>/dev/null) || COMMIT_TS=""
+  if [[ -n "$COMMIT_TS" ]] && (( $(date +%s) - COMMIT_TS > 900 )); then
+    exit 0
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Session state, both keyed on session ID in $TMPDIR and reset when the
+# session ends:
+#
+#   .state  count of nudges emitted this session, capped at 2
+#   .seen   commit SHAs already nudged about
+#
+# The de-dupe matters because the hook can fire more than once for the same
+# commit — a retried tool call, or a command that runs `git commit` inside a
+# larger pipeline. Without it a single commit could consume the whole session
+# budget. It is skipped when the SHA is unknown, which degrades to the old
+# count-only behavior rather than to no rate limiting at all.
+# ---------------------------------------------------------------------------
+
+SAFE_ID="${SESSION_ID//[^a-zA-Z0-9_-]/_}"
+STATE_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.state"
+SEEN_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.seen"
+LOCK_DIR="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.lock"
+
+# Both files are read, tested, and then written, so concurrent hooks in one
+# session would otherwise interleave: two could clear the de-dupe check for
+# the same SHA before either records it, and two could read the same offer
+# count and each write count+1, losing an increment and overrunning the cap.
+# Tool calls do run in parallel, so this is reachable — committing in two
+# repositories at once is enough.
+#
+# mkdir is the lock because it is atomic on POSIX and needs nothing that
+# isn't already assumed here. flock would be the conventional choice but is
+# util-linux, absent on stock macOS, and this hook ships to both.
+#
+# Losing the race means staying silent rather than waiting. Contention here
+# means another commit in the same session is being handled right now, so at
+# worst one nudge is skipped in a situation already near the session cap —
+# cheaper than making every commit wait on a lock.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  # Reclaim a lock orphaned by a process that died before releasing it,
+  # then take one more shot.
+  if [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+    rmdir "$LOCK_DIR" 2>/dev/null
+  fi
+  mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
+if [[ -n "$SHA" && -f "$SEEN_FILE" ]] && grep -qxF "$SHA" "$SEEN_FILE" 2>/dev/null; then
+  exit 0
+fi
 
 offers=0
 if [[ -f "$STATE_FILE" ]]; then
   offers=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
 fi
+# A corrupt or truncated state file must not wedge the hook open.
+[[ "$offers" =~ ^[0-9]+$ ]] || offers=0
 
 # Stop after 2 offers per session.
 if [[ "$offers" -ge 2 ]]; then
   exit 0
 fi
 
-# Record the offer.
+# ---------------------------------------------------------------------------
+# Grab the commit subject so the nudge names a concrete topic rather than
+# making the model guess what was committed. Sanitized for embedding in the
+# JSON string below: control characters, double quotes and backslashes
+# removed, length capped.
+# ---------------------------------------------------------------------------
+
+CONTEXT=""
+if [[ -n "$SHA" ]]; then
+  SUBJECT=$(git "${GIT_LOC[@]}" log -1 --pretty=%s 2>/dev/null \
+    | tr '[:cntrl:]' ' ' | tr -d '"\\' | cut -c1-120 \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  if [[ -n "$SUBJECT" ]]; then
+    CONTEXT=" (${SHA}: ${SUBJECT})"
+  else
+    CONTEXT=" (${SHA})"
+  fi
+fi
+
+# Record the emission, then emit. Both writes happen only on the path that
+# actually produces a nudge, so a call that exits early above never consumes
+# part of the session budget.
+[[ -n "$SHA" ]] && echo "$SHA" >> "$SEEN_FILE"
 echo $(( offers + 1 )) > "$STATE_FILE"
 
 # ---------------------------------------------------------------------------
 # Emit suggestion for Claude via structured JSON. PostToolUse hooks must
 # output JSON with hookSpecificOutput on exit 0 to inject context.
-# The message contains no special characters that need escaping.
+# Only $CONTEXT is interpolated, and it is sanitized above.
 # ---------------------------------------------------------------------------
 
-cat <<'HOOK_JSON'
-{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"[learning-opportunities-auto] The user just committed code. Per the learning-opportunities skill, consider whether this is a good moment to offer a learning exercise. If the committed work involved new files, schema changes, architectural decisions, refactors, or unfamiliar patterns, ask the user (one short sentence) if they'd like a 10-15 minute exercise. Do not start the exercise until they confirm. If they decline, note it — no more offers this session."}}
+cat <<HOOK_JSON
+{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"[learning-opportunities-auto] The user just committed code${CONTEXT}. Per the learning-opportunities skill, consider whether this is a good moment to offer a learning exercise. If the committed work involved new files, schema changes, architectural decisions, refactors, or unfamiliar patterns, ask the user (one short sentence) if they'd like a 10-15 minute exercise. Do not start the exercise until they confirm. If they decline, note it — no more offers this session."}}
 HOOK_JSON
 
 exit 0
