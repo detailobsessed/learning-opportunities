@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-use.sh"
+            "command": "bash -c 'script=\"${CLAUDE_PLUGIN_ROOT:-}/hooks/post-tool-use.sh\"; [ -f \"$script\" ] && exec bash \"$script\" || exit 0'"
           }
         ]
       }

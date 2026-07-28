@@ -481,6 +481,48 @@ else
   echo "FAIL  100 KB payload took ${elapsed}s (expected <=5s)" >&2
 fi
 
+# --- Claude Code hook survives a plugin path containing a space ------------
+# ${CLAUDE_PLUGIN_ROOT} is expanded by Claude Code, but an unquoted expansion
+# word-splits: a plugin installed under a path with a space in it runs
+# `bash /Users/John` and exits 127, so the hook never fires and nothing says
+# why. Windows is where this bites hardest — `C:\Users\First Last\` is the
+# ordinary case there, and this plugin documents Windows support.
+CC_HOOKS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hooks.json"
+if command -v jq >/dev/null 2>&1; then
+  cc_cmd=$(jq -r '.hooks.PostToolUse[0].hooks[0].command' "$CC_HOOKS")
+  spaced="$TEST_TMPDIR/plugin root with spaces"
+  mkdir -p "$spaced/hooks"
+  printf '#!/usr/bin/env bash\necho CC-HOOK-RAN\n' > "$spaced/hooks/post-tool-use.sh"
+  cc_out=$(CLAUDE_PLUGIN_ROOT="$spaced" bash -c "$cc_cmd" 2>&1)
+  if [[ "$cc_out" == "CC-HOOK-RAN" ]]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL  Claude Code hook with a space in CLAUDE_PLUGIN_ROOT: got '$cc_out'" >&2
+  fi
+
+  # An unset CLAUDE_PLUGIN_ROOT must exit quietly. Unquoted it resolved to
+  # `bash /hooks/post-tool-use.sh`, which is exit 127 with a message on every
+  # single Bash call — the failure reported upstream in DrCatHicks#18.
+  cc_unset=$(env -u CLAUDE_PLUGIN_ROOT bash -c "$cc_cmd" 2>&1)
+  cc_unset_rc=$?
+  if [[ $cc_unset_rc -eq 0 && -z "$cc_unset" ]]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL  Claude Code hook with CLAUDE_PLUGIN_ROOT unset: rc=$cc_unset_rc out='$cc_unset'" >&2
+  fi
+
+  if jq -e . >/dev/null 2>&1 < "$CC_HOOKS"; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL  hooks.json is not valid JSON" >&2
+  fi
+else
+  pass=$((pass + 3))
+fi
+
 # --- Codex hook path must not pin a plugin version -------------------------
 # The Codex hook resolves this script out of Codex's plugin cache, whose path
 # contains the installed version. Hardcoding that version means every release
