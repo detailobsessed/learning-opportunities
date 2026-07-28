@@ -1,5 +1,21 @@
 # Changelog
 
+## learning-opportunities-auto 1.1.0
+
+Commit detection accuracy, Jujutsu support, and a more precise nudge.
+
+**New:**
+- Jujutsu (`jj commit`) is recognized alongside `git commit`. In its default colocated mode `jj` writes real commits to the underlying `.git` directory, and the skill is VCS-agnostic in any case
+- The nudge names the commit it refers to, as `(<sha>: <subject>)`, so the skill has a concrete topic instead of inferring what was committed
+- Regression test suite at `learning-opportunities-auto/hooks/test-post-tool-use.sh`
+
+**Fixed:**
+- Commit detection scanned the entire hook payload, which contains the tool's output as well as its command. `git status` (whose output reads "nothing to commit") and `git log` (whose output reads "commit <sha>") therefore told the model that code had been committed. Detection now reads only the command field, and matches an anchored `git`/`jj` invocation rather than a loose substring
+- A rejected commit — failing pre-commit hook, nothing staged — left HEAD on the previous commit and nudged about already-finished work. HEAD's committer date is now checked to confirm the commit landed
+- Repeated hook fires for one commit could consume the whole two-offer session budget; emitted commits are now de-duplicated per session
+- A corrupt session state file no longer disables the rate limit
+- The Codex hook resolved its script from a cache path with the plugin version hardcoded in it, so every release silently disabled the hook until the string was bumped in lockstep, and a local development install was never found at all. The version is now resolved at runtime
+
 ## learning-opportunities-auto 1.0.2
 
 **Fixed:**
