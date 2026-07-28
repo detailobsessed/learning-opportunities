@@ -29,8 +29,9 @@ Credit belongs to **[@vosechu](https://github.com/vosechu)** ([#20], [#21]), **[
 [#15]: https://github.com/DrCatHicks/learning-opportunities/pull/15
 [#19]: https://github.com/DrCatHicks/learning-opportunities/pull/19
 [#21]: https://github.com/DrCatHicks/learning-opportunities/pull/21
+[#18]: https://github.com/DrCatHicks/learning-opportunities/issues/18
 
-## What's fixed (`learning-opportunities-auto` 1.1.0)
+## What's fixed (`learning-opportunities-auto` 1.1.1)
 
 | | Change |
 |---|---|
@@ -42,15 +43,16 @@ Credit belongs to **[@vosechu](https://github.com/vosechu)** ([#20], [#21]), **[
 | **Offer budget** | Repeated hook fires for one commit could burn the whole two-offer session budget. Emitted commits are de-duplicated per session, and a corrupt state file no longer disables the rate limit |
 | **Parallel hooks** | *(unfiled upstream)* Tool calls run in parallel, and the session state was read and written without a lock. Six concurrent hooks on one commit reliably emitted **six** nudges, on every run; the cap could be overrun the same way. Now one. Locking is `mkdir`-based — `flock` is util-linux and absent on stock macOS |
 | **Nudge precision** | The nudge now names its commit as `(<sha>: <subject>)`, so the skill has a concrete topic instead of inferring what was committed |
+| **Hook never firing** | The Claude Code hook expanded `${CLAUDE_PLUGIN_ROOT}` **unquoted**, so a plugin path containing a space word-split and `bash` exited 127 — the hook never ran and nothing said why. Windows is where this bites, `C:\Users\First Last\` being the ordinary shape there. Reported as [#18], where it's attributed to Claude Code not expanding the variable; it does expand it, and the missing quotes are the actual fault |
 | **Codex hook path** | *(unfiled upstream)* The Codex hook resolved its script from a cache path with the plugin version **hardcoded**, so every release silently disabled the hook until that string was bumped in lockstep — and a local dev install was never found at all. The version is now resolved at runtime, matching how Codex picks the active one: a `local` dev install if present, otherwise the highest installed version |
 
-A regression suite lives at [`learning-opportunities-auto/hooks/test-post-tool-use.sh`](learning-opportunities-auto/hooks/test-post-tool-use.sh) — 71 assertions, no dependencies beyond bash:
+A regression suite lives at [`learning-opportunities-auto/hooks/test-post-tool-use.sh`](learning-opportunities-auto/hooks/test-post-tool-use.sh) — 74 assertions, no dependencies beyond bash:
 
 ```
 ./learning-opportunities-auto/hooks/test-post-tool-use.sh
 ```
 
-The upstream hook fails 39 of them.
+The upstream hook fails 41 of them.
 
 ### Design constraints kept
 
