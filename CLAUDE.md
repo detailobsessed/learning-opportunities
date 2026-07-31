@@ -26,14 +26,15 @@ A Claude Code plugin packaging science-based learning exercises for deliberate s
 
 ## Releasing a New Version
 
-Each plugin has its own version. When releasing, update the version in four places atomically:
+Each plugin has its own version. When releasing, update it in three places atomically:
 
 1. `<plugin>/.claude-plugin/plugin.json` — bump `version`
 2. `<plugin>/.codex-plugin/plugin.json` — bump `version`
-3. `.claude-plugin/marketplace.json` — bump the matching plugin entry's `version`
-4. `CHANGELOG.md` — add entry at top, under the `# Changelog` heading
+3. `CHANGELOG.md` — add entry at top, under the `# Changelog` heading
 
-Use semver. All versioned files must show the same version string for the plugin being released. Commit them together.
+Use semver. Both manifests must show the same version string for the plugin being released. Commit them together.
+
+`.claude-plugin/marketplace.json` is **not** in that list, despite its plugin entries carrying a `version` field. Claude Code resolves a plugin's version from `plugin.json` first and the marketplace entry only if that is absent — ["Claude Code always uses the `plugin.json` value without warning"](https://code.claude.com/docs/en/plugin-marketplaces#version-resolution-and-release-channels), and the docs advise against setting both. The versions in the catalog are inert. The file changes when a plugin is added, renamed, or removed, not on release.
 
 `learning-opportunities-auto/hooks.codex.json` is deliberately **not** in that list. It resolves the hook script out of Codex's plugin cache, whose path contains the installed version, by globbing rather than naming a version. Do not reintroduce a hardcoded version there — it would have to be bumped in lockstep with every release, and it never matches a local dev install.
 
