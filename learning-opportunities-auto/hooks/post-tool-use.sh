@@ -35,6 +35,12 @@ INPUT=$(cat)
 #      keeps the hot path (every Bash call that isn't a commit) fast.
 #   2. Extract each "command"/"cmd" string value and test it on its own, so
 #      tool output is never scanned.
+#
+# A command may be several lines — `git add -A` and `git commit -m "..."` on
+# consecutive lines is how agents habitually write one, and a shell script
+# passed to the tool arrives the same way. In JSON those line breaks are the
+# two-character escape `\n`, so they are decoded to real newlines below and
+# every line is then matched on its own.
 # ---------------------------------------------------------------------------
 
 if ! echo "$INPUT" | grep -Eq '"(command|cmd)".*(git|jj).*commit'; then
@@ -43,11 +49,14 @@ fi
 
 # Anchored match for a real `git commit` / `jj commit` invocation:
 #
-#   (^|[;&|`({][[:space:]]*|\$\([[:space:]]*)
-#     Start of the command, or immediately after a shell separator (`;`, `&`,
-#     `|`, backtick, `(`, `{`) or a `$(` command substitution. Requiring a
-#     separator rather than mere whitespace is what rejects `git` appearing
-#     inside a quoted argument, e.g. `echo "how to git commit"`.
+#   (^[[:space:]]*|[;&|`({][[:space:]]*|\$\([[:space:]]*)
+#     Start of a line — grep matches line by line, so with the newlines decoded
+#     this covers every line of a multi-line command — or immediately after a
+#     shell separator (`;`, `&`, `|`, backtick, `(`, `{`) or a `$(` command
+#     substitution. Requiring a separator rather than mere whitespace is what
+#     rejects `git` appearing inside a quoted argument, e.g.
+#     `echo "how to git commit"`. Leading indentation is skipped, so `git` is
+#     still found on an indented line of a script.
 #
 #   (git|jj)
 #     The literal command name. The anchor above keeps `foogit`/`git-foo` out.
@@ -72,7 +81,210 @@ fi
 #     backslash escape. Keeps `git commit-tree` from matching.
 #
 # Adapted from @jasikpark's approach in DrCatHicks/learning-opportunities#15.
-COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:space:]"]+("[^"]*"|'"'"'[^'"'"']*'"'"')?([[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^-[:space:]"][^[:space:]"]*))?)*[[:space:]]+commit([[:space:]";|&)]|$|\\)'
+COMMIT_RE='(^[[:space:]]*|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:space:]"]+("[^"]*"|'"'"'[^'"'"']*'"'"')?([[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^-[:space:]"][^[:space:]"]*))?)*[[:space:]]+commit([[:space:]";|&)]|$|\\)'
+
+# Drop the lines that cannot start a command: heredoc bodies, and lines that
+# continue the previous one. Both are text the shell never runs as a command,
+# but with the line breaks decoded they start at column zero and would anchor
+# exactly like a real invocation.
+#
+# A line whose predecessor ends in an odd number of backslashes is a
+# continuation — `echo preparing to \` then `git commit` passes `git` and
+# `commit` to echo. An even count is escaped backslashes, not a continuation.
+# Such a line is spliced onto the one above rather than dropped, because the
+# joined text is what the shell runs: dropping it would lose the commit in
+# `env \` + `git commit -m x`, and a missed nudge is the failure this hook
+# exists to prevent. Joined, a continuation behaves exactly like the same
+# command written on one line.
+#
+# The heredoc's opening line is kept, because
+# `git commit -m "$(cat <<EOF ... EOF)"` is a real commit that merely takes
+# its message from a heredoc.
+#
+# `<<WORD`, `<<-WORD`, and a quoted `<<"WORD"` / `<<'WORD'` / `<<\WORD` all
+# start one, and one line can start several. The terminator is matched as the
+# shell matches it: leading tabs stripped after `<<-`, nothing stripped after
+# a plain `<<`, and nothing trailing stripped after either.
+#
+# The delimiter runs to the end of the word, dots and hyphens included:
+# capturing only `END` from `<<END-MARKER` means the real terminator never
+# matches, the heredoc never closes, and every line after it — including a
+# real commit — is swallowed.
+#
+# Two things are kept out of it. The leading (^|[^<]) rejects a `<<<`
+# herestring, whose word is data rather than a delimiter. The trailing
+# boundary rejects an arithmetic left-shift, `$((a<<b))`, where `b))` would
+# otherwise be read as a delimiter that no later line can match; a real
+# delimiter is followed by whitespace, a redirect, a separator, or the end of
+# the line. Both mistakes fail the same way — swallowing the rest of the
+# command — which is why they are worth excluding by construction.
+#
+# `<<` inside a quoted string still reads as a heredoc here, so a command that
+# prints the text `<<EOF` could suppress a commit on a later line. That
+# direction — a missed nudge on a contrived command — is the safe one.
+#
+# What is deliberately *not* tracked is quoting state across lines. A
+# multi-line single-quoted string — `printf '%s' 'notes:` then
+# `git commit -m x'` — still reads as a commit. Tracking it properly means
+# tracking comments across lines as well, and one `# don't do this` would then
+# read as an open quote and suppress a real commit on the next line. (The
+# comment handling below is a different thing: it looks at one line at a time
+# and only to decide whether a `<<` on it opens a heredoc.) That trades a rare
+# spurious offer — already capped at two per session and gated on a fresh
+# HEAD — for the silently missed nudge this hook exists to prevent. Wrong
+# direction, and declined deliberately when automated review raised it.
+# Fold `.` and `..` out of a path textually, which is what the shell means by
+# resolving `cd` *logically* — its default. `cd link` then `cd ..` returns to
+# the directory holding `link`, not to the parent of whatever `link` points at.
+# Joining the raw components instead and handing `…/link/..` to `git -C` lets
+# the kernel resolve it physically, through the symlink, and git then reads a
+# different repository — the wrong-repo failure this block exists to avoid.
+#
+# Split by parameter expansion rather than `IFS=/` word splitting, which would
+# glob-expand a component containing `*`.
+normalize_logical() {
+  local path="$1" part out=""
+  while [[ -n "$path" ]]; do
+    part="${path%%/*}"
+    if [[ "$part" == "$path" ]]; then path=""; else path="${path#*/}"; fi
+    case "$part" in
+      ''|.) ;;
+      ..)   out="${out%/*}" ;;
+      *)    out="$out/$part" ;;
+    esac
+  done
+  printf '%s' "${out:-/}"
+}
+
+# The contents of every command substitution on a line, one per output line.
+# An unquoted heredoc body is not inert: the shell expands `$(...)` and
+# backticks in it and runs what is inside, so that text is code even though the
+# line around it is not. Only the substituted text is returned — the prose
+# around it stays out, so a body line reading `then ; git commit` is not
+# mistaken for a command while `$(git commit -m x)` is found.
+#
+# Non-nested, and the inner `)`/backtick wins where they nest. That truncates
+# `$(git commit -m "$(date)")` to `git commit -m "$(date`, which still matches;
+# a nesting this deep inside a heredoc body is not worth a character-by-
+# character scan on every line.
+command_substitutions() {
+  local s="$1" subs="" inner before_d before_b before esc kind
+  while :; do
+    before_d="${s%%\$(*}"
+    before_b="${s%%\`*}"
+    if [[ "$s" == *'$('* ]] && { [[ "$s" != *\`* ]] || (( ${#before_d} < ${#before_b} )); }; then
+      kind=dollar; before="$before_d"
+    elif [[ "$s" == *\`* ]]; then
+      kind=backtick; before="$before_b"
+    else
+      break
+    fi
+    # A backslash quotes the opener, so `\$(git commit -m x)` in a body is
+    # written out literally and runs nothing. An even run of backslashes is
+    # escaped backslashes and the opener still opens. Skipping past a quoted
+    # opener rather than stopping keeps a real substitution later on the same
+    # line findable.
+    esc="${before##*[!\\]}"
+    if [[ "$kind" == dollar ]]; then
+      s="${s#*\$(}"
+      (( ${#esc} % 2 == 1 )) && continue
+      inner="${s%%)*}"
+      s="${s#*)}"
+    else
+      s="${s#*\`}"
+      (( ${#esc} % 2 == 1 )) && continue
+      inner="${s%%\`*}"
+      s="${s#*\`}"
+    fi
+    subs+="$inner"$'\n'
+  done
+  printf '%s' "$subs"
+}
+
+strip_noncommand_lines() {
+  local line tail rest head dash delim quoted body scan comment_head dquotes squotes
+  local tab=$'\t' squote="'" pending="" continued="" out=""
+  local heredoc_re='(^|[^<])<<(-?)[[:space:]]*("|'"'"'|\\)?([A-Za-z_][A-Za-z0-9_.-]*)("|'"'"'|\\)?([[:space:];|&<>]|$)'
+  while IFS= read -r line; do
+    if [[ -n "$pending" ]]; then
+      head="${pending%%$'\n'*}"
+      dash="${head%%$tab*}"
+      delim="${head##*$tab}"
+      quoted="${head#*$tab}"
+      quoted="${quoted%%$tab*}"
+      # The terminator is matched the way the shell matches it. `<<-` strips
+      # leading tabs, and only tabs; a plain `<<` strips nothing; neither
+      # strips anything trailing. Accepting a space-indented or
+      # trailing-space `EOF` closes the heredoc early, and the body lines
+      # below it — `git commit -m x` among them — then read as commands.
+      if [[ "$dash" == - ]]; then
+        [[ "${line#"${line%%[!$tab]*}"}" == "$delim" ]] && pending="${pending#*$'\n'}"
+      else
+        [[ "$line" == "$delim" ]] && pending="${pending#*$'\n'}"
+      fi
+      # A quoted delimiter — `<<'EOF'`, `<<"EOF"`, `<<\EOF` — makes the body
+      # literal text and there is nothing in it to run. An unquoted one does
+      # not: the shell substitutes commands in the body before writing it out,
+      # so a `$(git commit -m x)` there is a commit that really happens. Keep
+      # the substituted text alone; the rest of the body stays out.
+      if [[ -z "$quoted" ]]; then
+        body=$(command_substitutions "$line")
+        [[ -n "$body" ]] && out+="$body"
+      fi
+      continue
+    fi
+    if [[ -n "$continued" ]]; then
+      # Splice onto the previous line, exactly as the shell does: the
+      # backslash and the newline both go, and what is left is one command.
+      out="${out%$'\n'}"
+      out="${out%\\}"
+    fi
+    out+="$line"$'\n'
+    # A `#` that starts a comment ends the command, so `# example: cat <<EOF`
+    # opens nothing. Without this the phantom heredoc never closes and every
+    # line below it is dropped, including a real commit — the silent miss this
+    # hook exists to prevent.
+    #
+    # This has to come before the continuation check below, not after it. A
+    # backslash inside a comment is part of the comment: bash runs
+    # `echo done # example \` and the line after it as two separate commands,
+    # and splicing them would strip the second line's anchor and lose a commit
+    # sitting on it.
+    #
+    # The `#` has to be unquoted to start a comment, and quoting is only
+    # tracked within this one line: the text before the `#` counts as a
+    # comment marker when its quotes balance and it ends at a word boundary.
+    # `git commit -m "fix #3"` leaves an odd double quote open, so the whole
+    # line is used as before. Erring that way costs at most the heredoc
+    # handling that was already in place.
+    scan="$line"
+    comment_head="${line%%#*}"
+    if [[ "$comment_head" != "$line" ]]; then
+      dquotes="${comment_head//[!\"]/}"
+      squotes="${comment_head//[!$squote]/}"
+      if (( ${#dquotes} % 2 == 0 && ${#squotes} % 2 == 0 )) \
+         && [[ -z "$comment_head" || "$comment_head" == *[[:space:]] ]]; then
+        scan="$comment_head"
+      fi
+    fi
+    # The trailing run of backslashes, which is the whole line when the line is
+    # nothing but backslashes. An odd count continues the command; an even count
+    # is escaped backslashes and ends it. Counted on the pre-comment text for
+    # the reason given above.
+    tail="${scan##*[!\\]}"
+    if (( ${#tail} % 2 == 1 )); then continued=1; else continued=""; fi
+    # One line can open several heredocs — `cat <<A; cat <<B`, and also
+    # `cat <<FIRST <<SECOND`, whose bodies the shell reads in order however
+    # little sense the redirect makes. Queue every opener on the line, in
+    # order, rather than only the first.
+    rest="$scan"
+    while [[ "$rest" =~ $heredoc_re ]]; do
+      pending+="${BASH_REMATCH[2]}$tab${BASH_REMATCH[3]}$tab${BASH_REMATCH[4]}"$'\n'
+      rest="${rest#*"${BASH_REMATCH[0]}"}"
+    done
+  done <<< "$1"
+  printf '%s' "$out"
+}
 
 # Pull out every "command"/"cmd" JSON string value. The inner
 # ([^"\\]|\\.)* consumes escaped quotes so a value like
@@ -82,6 +294,7 @@ COMMIT_RE='(^|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:sp
 # payload — a key order the hook contract does not guarantee.
 FOUND_COMMIT=0
 MATCHED_CMD=""
+PRE_CMD=""
 while IFS= read -r cmd; do
   [[ -z "$cmd" ]] && continue
   # The payload is JSON, so the command arrives escaped: a quoted path written
@@ -91,17 +304,35 @@ while IFS= read -r cmd; do
   # defeat both, and the hook silently falls back to the session cwd.
   #
   # `\\` is folded to a sentinel first so an escaped backslash sitting right
-  # before a quote (`...\\"`) isn't misread as an escaped quote. Other JSON
-  # escapes are left alone: \n and \t are not part of a path, and turning them
-  # into real control characters would only give the parsing more to trip on.
+  # before a quote (`...\\"`) isn't misread as an escaped quote. That also
+  # keeps a literal backslash-n in the command — `printf 'a\nb'`, which the
+  # payload escapes as `\\n` — from being turned into a line break here.
+  #
+  # Line breaks and tabs become real characters, because they are separators
+  # the pattern has to see: `git add -A\ngit commit -m "..."` is one command
+  # with two lines, and left as the two-character `\n` the second line reads
+  # as a continuation of the first, where nothing anchors `git`. A `\r` is
+  # folded into a newline as well — as a separator the two are equivalent
+  # here, and a CRLF payload then splits like any other.
   cmd="${cmd//\\\\/$'\001'}"
   cmd="${cmd//\\\"/\"}"
+  cmd="${cmd//\\n/$'\n'}"
+  cmd="${cmd//\\r/$'\n'}"
+  cmd="${cmd//\\t/$'\t'}"
   cmd="${cmd//$'\001'/\\}"
-  # Strip leading whitespace so the `^` anchor still applies to " git commit".
-  cmd="${cmd#"${cmd%%[![:space:]]*}"}"
-  if echo "$cmd" | grep -Eq "$COMMIT_RE"; then
+  cmd=$(strip_noncommand_lines "$cmd")
+  match_line=$(echo "$cmd" | grep -nE "$COMMIT_RE" | head -1 | cut -d: -f1)
+  if [[ -n "$match_line" ]]; then
     FOUND_COMMIT=1
-    MATCHED_CMD="$cmd"
+    # The redirect parsing below reads the options of the commit invocation
+    # itself, so it gets that line rather than the whole command: a `-C` or
+    # `--git-dir` belonging to some unrelated line of a multi-line script
+    # would otherwise send the queries to a different repository.
+    MATCHED_CMD=$(echo "$cmd" | sed -n "${match_line}p")
+    # Everything up to and including that line, for the `cd` fallback: a
+    # directory change only moves the shell for what comes after it, so a `cd`
+    # below the commit is irrelevant and must not be read.
+    PRE_CMD=$(echo "$cmd" | sed -n "1,${match_line}p")
     break
   fi
 done < <(echo "$INPUT" | grep -oE '"(command|cmd)":"([^"\\]|\\.)*"' | sed -E 's/^"(command|cmd)":"//; s/"$//')
@@ -162,10 +393,20 @@ opt_value() {
 
 # Strip one layer of quoting and resolve a relative path against the session
 # cwd, which is where the shell would have resolved it.
-unquote_path() {
+unquote() {
   local v="$1"
   v="${v%\"}"; v="${v#\"}"
   v="${v%\'}"; v="${v#\'}"
+  printf '%s' "$v"
+}
+
+# Quote removal plus resolution against the session cwd, which is the right
+# base for -C, -R, --git-dir and --work-tree: those take effect wherever the
+# shell already is. A chain of `cd`s is the exception and resolves each step
+# against the one before it, so that loop unquotes without resolving.
+unquote_path() {
+  local v
+  v=$(unquote "$1")
   [[ -n "$v" && "$v" != /* ]] && v="$CWD/$v"
   printf '%s' "$v"
 }
@@ -193,9 +434,42 @@ elif [[ -n "$WORK_TREE" && -d "$WORK_TREE" ]]; then
 else
   redirect=$(unquote_path "$(opt_value 'C|R')")
   if [[ -z "$redirect" ]]; then
-    redirect=$(printf '%s' "$MATCHED_CMD" \
-      | sed -nE 's/^(cd|pushd)[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\2/p' | head -1)
-    redirect=$(unquote_path "$redirect")
+    # This one reads every line up to the commit, not just the commit's own: a
+    # `cd` on an earlier line of a multi-line script moves the shell for
+    # everything that follows, exactly as `cd /repo && git commit` does on one
+    # line. The last one that *could have succeeded* wins — `cd /a`, then
+    # `cd /b`, then commit lands in /b — and a `cd` below the commit was
+    # excluded from PRE_CMD.
+    #
+    # Existence is what makes a cd the winner, not position. A cd to a missing
+    # directory fails and leaves the shell where it was, so `cd /repo` then
+    # `cd /gone` then commit still lands in /repo; taking /gone and then
+    # discarding it for not existing would fall back to the session cwd and
+    # attribute the commit to a repository it was never made in.
+    #
+    # Relative arguments compound, so each is resolved against the directory
+    # the previous cd established rather than against the session cwd: `cd a`
+    # then `cd b` lands in <cwd>/a/b, and testing <cwd>/b instead finds an
+    # unrelated directory or none at all. `cd_base` walks forward exactly as
+    # the shell's working directory does.
+    #
+    # This is an approximation either way — a cd inside a branch that never
+    # runs still counts here — but one that errs toward the directory the
+    # commit most likely landed in.
+    cd_base="$REPO_DIR"
+    while IFS= read -r cd_arg; do
+      cd_arg=$(unquote "$cd_arg")
+      [[ -z "$cd_arg" ]] && continue
+      case "$cd_arg" in
+        /*) cd_candidate=$(normalize_logical "$cd_arg") ;;
+        *)  cd_candidate=$(normalize_logical "$cd_base/$cd_arg") ;;
+      esac
+      if [[ -d "$cd_candidate" ]]; then
+        cd_base="$cd_candidate"
+        redirect="$cd_candidate"
+      fi
+    done <<< "$(printf '%s' "$PRE_CMD" \
+      | sed -nE 's/^[[:space:]]*(cd|pushd)[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\2/p')"
   fi
   # An unresolvable path leaves the session cwd in place rather than guessing.
   [[ -n "$redirect" && -d "$redirect" ]] && REPO_DIR="$redirect"

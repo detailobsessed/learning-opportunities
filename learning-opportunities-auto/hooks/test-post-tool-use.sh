@@ -53,13 +53,25 @@ json_escape() {
 # assert <expected: nudge|silent> <command> [tool output]
 assert() {
   local expected="$1" command="$2" output="${3:-}"
-  local payload actual
+  local payload actual out status
   case_n=$((case_n + 1))
 
   payload=$(printf '{"session_id":"test-%s","cwd":"%s","tool_input":{"command":"%s"},"tool_response":{"output":"%s"}}' \
     "$case_n" "$(json_escape "$REPO")" "$(json_escape "$command")" "$(json_escape "$output")")
 
-  if printf '%s' "$payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null | grep -q additionalContext; then
+  # A crash has to be distinguishable from the intended silence. Without the
+  # exit status, a hook that dies before printing anything produces no
+  # `additionalContext` and every `silent` expectation passes — the suite goes
+  # green on a hook that never runs.
+  out=$(printf '%s' "$payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+  status=$?
+  if (( status != 0 )); then
+    fail=$((fail + 1))
+    printf 'FAIL  hook exited %-3s              cmd=%s\n' "$status" "$command" >&2
+    return
+  fi
+
+  if grep -q additionalContext <<<"$out"; then
     actual="nudge"
   else
     actual="silent"
@@ -87,6 +99,198 @@ assert nudge 'git -C /some/repo commit -m "msg"'
 assert nudge 'git -c user.name=Test commit -m "msg"'
 assert nudge '$(git commit -m "msg")'
 assert nudge '  git commit -m "leading whitespace"'
+assert nudge 'git	commit -m "tab separated"'
+
+# --- multi-line commands: must nudge ---------------------------------------
+# The line break reaches the hook as the JSON escape \n, which used to leave
+# every line after the first unanchored — the two-line "stage, then commit"
+# an agent writes by habit was silently ignored.
+assert nudge 'git add -A
+git commit -m "wip"'
+assert nudge 'git status
+git diff --stat
+git commit -m "third line"'
+assert nudge 'git add -A
+  git commit -m "indented"'
+assert nudge '#!/usr/bin/env bash
+set -e
+git commit -m "in a script"'
+assert nudge 'git add -A
+jj commit -m "wip"'
+
+# --- multi-line non-commits: must stay silent ------------------------------
+assert silent 'git status
+git log --oneline' 'nothing to commit, working tree clean'
+assert silent 'echo "how to git commit"
+ls -la'
+assert silent 'grep -rn "git commit" docs/
+wc -l docs/*'
+# A literal backslash-n in the command is not a line break: the payload
+# escapes it as \\n, and decoding it as one would anchor `git` mid-string.
+assert silent 'printf "run git commit\nnext\n"'
+
+# --- heredoc bodies: text, not invocations ---------------------------------
+# The false positive multi-line support opens up: a heredoc body starts at
+# column zero like any other line, so `git commit` written into a script or a
+# doc would anchor exactly like a real invocation.
+assert silent 'cat <<EOF > script.sh
+git commit -m "x"
+EOF'
+assert silent "cat <<'EOF' > notes.md
+git commit -m \"x\"
+EOF"
+assert silent 'cat <<-EOF > script.sh
+	git commit -m "x"
+	EOF'
+# The terminator is matched the way the shell matches it. `<<-` strips leading
+# tabs and nothing else, so a space-indented `EOF` is body text and the heredoc
+# is still open on the line below it.
+assert silent 'cat <<-EOF > script.sh
+	alpha
+  EOF
+	git commit -m "x"
+	EOF'
+# A plain `<<` strips nothing, so a tab-indented `EOF` is body text too.
+assert silent 'cat <<EOF > script.sh
+alpha
+	EOF
+git commit -m "x"
+EOF'
+# Trailing whitespace is never stripped either. The space after the first
+# `EOF` is what keeps the heredoc open, so it is written as \x20 rather than
+# left as trailing whitespace an editor would silently eat.
+assert silent $'cat <<EOF > script.sh\nEOF\x20\ngit commit -m "x"\nEOF'
+# A comment is not a redirection. `# example: cat <<EOF` would otherwise open
+# a heredoc that never closes, swallowing every line below it — including a
+# real commit, which is the silent miss this hook exists to prevent.
+assert nudge '# example: cat <<EOF
+git commit -m "x"'
+assert nudge 'ls -la # prints them, unlike cat <<EOF
+git commit -m "x"'
+# ...but a `#` inside a quoted string is text, so the heredoc on this line is
+# real and its body still gets skipped.
+assert silent 'cat <<EOF > script.sh # writes the script
+git commit -m "x"
+EOF'
+# A backslash quotes the delimiter exactly as `<<'EOF'` does, and the
+# terminator is still the bare word.
+assert silent 'cat <<\EOF > script.sh
+git commit -m "x"
+EOF'
+# One line can open more than one heredoc, and the shell consumes every body
+# in order. Tracking only the first leaves the second body reading as
+# commands.
+assert silent 'cat <<A; cat <<B
+git commit -m "in A"
+A
+git commit -m "in B"
+B'
+assert silent 'cat <<FIRST <<SECOND
+git commit -m "in FIRST"
+FIRST
+git commit -m "in SECOND"
+SECOND'
+# ...but the opening line and everything after the terminator still count.
+assert nudge 'cat <<EOF > doc.md
+run git commit here
+EOF
+git commit -m "x"'
+assert nudge 'git commit -F - <<EOF
+subject line
+EOF'
+# A `<<<` herestring is not a heredoc: reading its word as a delimiter would
+# swallow every line that follows, including a real commit.
+assert nudge 'grep foo <<< "git commit"
+git commit -m "x"'
+# The delimiter runs to the end of the word. Capturing only `END` from
+# `<<END-MARKER` leaves the heredoc open forever and eats the commit below it.
+assert nudge 'cat <<END-MARKER > script.sh
+git commit -m "in the body"
+END-MARKER
+git commit -m "x"'
+# `$((a<<b))` is a left shift, not a heredoc opening a `b))` body.
+assert nudge 'echo $((a<<b))
+git commit -m "x"'
+# Both bodies close, so the commit below them is a real one.
+assert nudge 'cat <<A; cat <<B
+alpha
+A
+beta
+B
+git commit -m "x"'
+# An unquoted delimiter does not make the body inert. The shell substitutes
+# commands in it before writing anything out, so this `git commit` really runs
+# — verified against bash, where the commit lands and HEAD moves.
+assert nudge 'cat <<EOF > notes.txt
+built at $(git commit -m "x")
+EOF'
+# Backticks are the same substitution in older spelling.
+assert nudge 'cat <<EOF > notes.txt
+built at `git commit -m "x"`
+EOF'
+# ...but a quoted delimiter *is* inert, in all three spellings, so the same
+# body is text and nothing runs.
+assert silent 'cat <<'"'"'EOF'"'"' > notes.txt
+built at $(git commit -m "x")
+EOF'
+assert silent 'cat <<"EOF" > notes.txt
+built at $(git commit -m "x")
+EOF'
+assert silent 'cat <<\EOF > notes.txt
+built at $(git commit -m "x")
+EOF'
+# Only the substituted text is code. A separator in the prose around it is
+# body text, not a command boundary, so this stays silent.
+assert silent 'cat <<EOF > notes.txt
+built at $(date) ; git commit -m "x"
+EOF'
+# A backslash quotes the opener even in an unquoted body: bash writes
+# `\$(git commit -m x)` out literally and runs nothing.
+assert silent 'cat <<EOF > notes.txt
+literal: \$(git commit -m "x")
+EOF'
+assert silent 'cat <<EOF > notes.txt
+literal: \`git commit -m "x"\`
+EOF'
+# Two backslashes are an escaped backslash, so the opener still opens.
+assert nudge 'cat <<EOF > notes.txt
+literal backslash then \\$(git commit -m "x")
+EOF'
+# A quoted opener must not hide a real substitution later on the same line.
+assert nudge 'cat <<EOF > notes.txt
+\$(not a command) and then $(git commit -m "x")
+EOF'
+# And a body with no substitution at all is unchanged by any of this.
+assert silent 'cat <<EOF > script.sh
+git commit -m "in the body"
+EOF'
+
+# --- backslash continuations: spliced, not dropped -------------------------
+# `echo preparing to \` then `git commit` passes `git` and `commit` to echo,
+# so the joined line has nothing anchoring `git`.
+assert silent 'echo preparing to \
+git commit'
+# A backslash inside a comment is part of the comment, not a continuation, so
+# the commit below stands on its own line and still anchors.
+assert nudge 'echo done # example \
+git commit -m "x"'
+# ...but an unbalanced quote means the `#` is text, so this really is a
+# continuation and the joined line runs `echo` with `git commit` as arguments.
+assert silent 'echo "a#b" \
+git commit'
+assert silent 'ls \
+	git commit'
+# An even count is escaped backslashes, so the next line does start a command.
+assert nudge 'echo done\\
+git commit -m "x"'
+# The continuation of a real commit is still part of it.
+assert nudge 'git commit \
+  -m "wrapped over two lines"'
+# Splicing, not dropping: the separator sits on the first line and the commit
+# on the second, so only the joined text matches. Dropping the continuation
+# would lose this commit entirely.
+assert nudge 'cd /some/repo && \
+  git commit -m "x"'
 
 # --- jj (Jujutsu) commits: must nudge --------------------------------------
 assert nudge 'jj commit'
@@ -244,6 +448,124 @@ if grep -q "commit in the other repo" <<<"$cd_out"; then
 else
   fail=$((fail + 1))
   echo "FAIL  cd redirect: expected the other repo's commit, got: $cd_out" >&2
+fi
+
+# --- commit targeting another repo via a cd on an earlier line -------------
+# The redirect and the commit are on separate lines, which is how a script
+# passed to the tool is shaped. The session cwd is the stale repo, so a nudge
+# naming the other repo's commit is the only proof the cd was followed.
+mlcd_payload=$(printf '{"session_id":"test-mlcd","cwd":"%s","tool_input":{"command":"cd %s\\ngit add -A\\ngit commit -m \\"x\\""},"tool_response":{}}' "$stale_repo" "$other_repo")
+mlcd_out=$(printf '%s' "$mlcd_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+if grep -q "commit in the other repo" <<<"$mlcd_out"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  multi-line cd redirect: expected the other repo's commit, got: $mlcd_out" >&2
+fi
+
+# --- a -C on an unrelated line must not hijack the lookup ------------------
+# Only the commit's own line carries the redirect: the stale repo is read by a
+# `git -C ... log` line above the commit, which lands in the session cwd — the
+# fresh repo — so the nudge must name that commit, not the stale one.
+fresh_commit "the real subject"
+mlopt_payload=$(printf '{"session_id":"test-mlopt","cwd":"%s","tool_input":{"command":"git -C %s log --oneline\\ngit commit -m \\"x\\""},"tool_response":{}}' "$REPO" "$stale_repo")
+mlopt_out=$(printf '%s' "$mlopt_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+if grep -q "the real subject" <<<"$mlopt_out"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  unrelated -C line hijacked the repo lookup, got: $mlopt_out" >&2
+fi
+
+# --- the last cd before the commit wins ------------------------------------
+# `cd <stale>` then `cd <other>` then commit lands in the other repo. Taking
+# the first cd instead would read the stale HEAD and drop the nudge.
+lastcd_payload=$(printf '{"session_id":"test-lastcd","cwd":"%s","tool_input":{"command":"cd %s\\ncd %s\\ngit commit -m \\"x\\""},"tool_response":{}}' "$REPO" "$stale_repo" "$other_repo")
+lastcd_out=$(printf '%s' "$lastcd_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+if grep -q "commit in the other repo" <<<"$lastcd_out"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  last cd before the commit: expected the other repo's commit, got: $lastcd_out" >&2
+fi
+
+# --- relative cds compound, as they do in the shell ------------------------
+# `cd nest` then `cd inner` lands in <cwd>/nest/inner, not in <cwd>/inner.
+# Resolving each argument against the session cwd instead of against the
+# directory the previous cd established reads an unrelated path — or none —
+# and the commit is attributed to the wrong repository.
+nested_repo="$TEST_TMPDIR/nestbase/nest/inner"
+mkdir -p "$nested_repo"
+git init -q "$nested_repo"
+git -C "$nested_repo" config user.email test@example.com
+git -C "$nested_repo" config user.name "Test"
+git -C "$nested_repo" config commit.gpgsign false
+echo nested > "$nested_repo/file.txt"
+git -C "$nested_repo" add file.txt
+git -C "$nested_repo" commit -q -m "commit in the nested repo"
+relcd_payload=$(printf '{"session_id":"test-relcd","cwd":"%s","tool_input":{"command":"cd nest\\ncd inner\\ngit commit -m \\"x\\""},"tool_response":{}}' "$TEST_TMPDIR/nestbase")
+relcd_out=$(printf '%s' "$relcd_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+if grep -q "commit in the nested repo" <<<"$relcd_out"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  chained relative cd: expected the nested repo's commit, got: $relcd_out" >&2
+fi
+
+# --- a cd chain through a symlink resolves logically -----------------------
+# `cd link` then `cd ..` returns to the directory holding the symlink, which is
+# what the shell's default logical `cd` does. Joining the components and
+# letting the kernel resolve `.../link/..` goes through the symlink to the
+# parent of its *target* instead, and the commit gets attributed to whatever
+# repository happens to sit there.
+symbase="$TEST_TMPDIR/symbase"
+mkdir -p "$symbase/top" "$symbase/deep/real"
+ln -s "$symbase/deep/real" "$symbase/top/link"
+for r in "$symbase/top" "$symbase/deep"; do
+  git init -q "$r"
+  git -C "$r" config user.email test@example.com
+  git -C "$r" config user.name "Test"
+  git -C "$r" config commit.gpgsign false
+  echo x > "$r/file.txt"
+  git -C "$r" add file.txt
+done
+git -C "$symbase/deep" commit -q -m "commit in the symlink target's parent"
+git -C "$symbase/top" commit -q -m "commit beside the symlink"
+symcd_payload=$(printf '{"session_id":"test-symcd","cwd":"%s","tool_input":{"command":"cd link\\ncd ..\\ngit commit -m \\"x\\""},"tool_response":{}}' "$symbase/top")
+symcd_out=$(printf '%s' "$symcd_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+if grep -q "commit beside the symlink" <<<"$symcd_out"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  symlinked cd chain resolved physically, got: $symcd_out" >&2
+fi
+
+# --- a cd that could not have succeeded must not win -----------------------
+# `cd <other>` then `cd /nonexistent` leaves the shell in <other>, because the
+# second cd fails. Taking the last cd textually and then discarding it for not
+# existing falls back to the session cwd, attributing the commit to a
+# repository it was never made in.
+failedcd_payload=$(printf '{"session_id":"test-failedcd","cwd":"%s","tool_input":{"command":"cd %s\\ncd %s/definitely-not-here\\ngit commit -m \\"x\\""},"tool_response":{}}' "$REPO" "$other_repo" "$TEST_TMPDIR")
+failedcd_out=$(printf '%s' "$failedcd_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+if grep -q "commit in the other repo" <<<"$failedcd_out"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  failed cd overrode a real one, got: $failedcd_out" >&2
+fi
+
+# --- a cd below the commit must be ignored ---------------------------------
+# The commit runs in the session cwd; the cd that follows moves the shell only
+# for what comes after it. Reading it would attribute the commit to the wrong
+# repository — here the stale one, which would suppress the nudge outright.
+fresh_commit "committed before the cd"
+aftercd_payload=$(printf '{"session_id":"test-aftercd","cwd":"%s","tool_input":{"command":"git commit -m \\"x\\"\\ncd %s"},"tool_response":{}}' "$REPO" "$stale_repo")
+aftercd_out=$(printf '%s' "$aftercd_payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+if grep -q "committed before the cd" <<<"$aftercd_out"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL  cd below the commit was applied, got: $aftercd_out" >&2
 fi
 
 # --- other redirect forms: --git-dir, --work-tree, pushd, and = syntax ------
@@ -598,6 +920,60 @@ if command -v jq >/dev/null 2>&1; then
   else
     fail=$((fail + 1))
     echo "FAIL  Codex hook with no cache should exit 0" >&2
+  fi
+else
+  pass=$((pass + 3))
+fi
+
+# --- the hook must still run under bash 3.2 --------------------------------
+# `hooks.json` launches the hook as `bash "$script"`, resolved off PATH, and
+# on a stock macOS that is /bin/bash 3.2.57 — Apple never shipped a newer one.
+# Bash 4 syntax there is not a graceful degradation but a parse error, so the
+# hook would die on every Bash tool call. These run only when an old bash is
+# actually present; elsewhere they are counted as passed so the total stays
+# stable across machines.
+old_bash=""
+for candidate in /bin/bash /usr/bin/bash; do
+  if [[ -x "$candidate" ]]; then
+    v=$("$candidate" -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null)
+    if [[ -n "$v" && "$v" -lt 4 ]]; then old_bash="$candidate"; break; fi
+  fi
+done
+
+if [[ -n "$old_bash" ]]; then
+  # Syntax first: this is the failure that would take out every tool call.
+  if "$old_bash" -n "$HOOK" 2>/dev/null; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL  hook does not parse under $($old_bash --version | head -1)" >&2
+  fi
+
+  # Then end to end, because the parser is not the only thing that changed in
+  # bash 4 — expanding an empty array under `set -u` is an error here.
+  fresh_commit "committed under old bash"
+  ob_payload=$(printf '{"session_id":"test-oldbash","cwd":"%s","tool_input":{"command":"cd %s\\ngit add -A\\ngit commit -m \\"x\\""},"tool_response":{}}' "$REPO" "$REPO")
+  if printf '%s' "$ob_payload" | TMPDIR="$TEST_TMPDIR" "$old_bash" "$HOOK" 2>/dev/null | grep -q "committed under old bash"; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL  multi-line commit not recognized under $old_bash" >&2
+  fi
+
+  # Silence is only the right answer if the hook got far enough to be silent,
+  # so the exit status is checked alongside the output. A hook that dies under
+  # 3.2 prints nothing either, and would otherwise pass this as intended.
+  ob_silent=$(printf '{"session_id":"test-oldbash-hd","cwd":"%s","tool_input":{"command":"cat <<EOF > script.sh\\ngit commit -m \\"x\\"\\nEOF"},"tool_response":{}}' "$REPO")
+  ob_out=$(printf '%s' "$ob_silent" | TMPDIR="$TEST_TMPDIR" "$old_bash" "$HOOK" 2>/dev/null)
+  ob_status=$?
+  if (( ob_status != 0 )); then
+    fail=$((fail + 1))
+    echo "FAIL  hook exited $ob_status on a heredoc under $old_bash" >&2
+  elif grep -q additionalContext <<<"$ob_out"; then
+    fail=$((fail + 1))
+    echo "FAIL  heredoc body reported a commit under $old_bash" >&2
+  else
+    pass=$((pass + 1))
   fi
 else
   pass=$((pass + 3))
