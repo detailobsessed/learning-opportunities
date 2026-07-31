@@ -1,0 +1,60 @@
+# Configuration file for `prek`, a git hook framework written in Rust.
+# See https://prek.j178.dev for more information.
+#:schema https://www.schemastore.org/prek.json
+#
+# Everything here is a prek builtin, so there is nothing to clone and no
+# environment to build. The one exception is the regression suite below, which
+# is this repository's own script and only runs when the hook it tests changes.
+
+# Hooks that rewrite files, scoped to what the fork maintains.
+# `learning-opportunities/` and `orient/` hold upstream's skill content, which
+# this fork promises not to change; normalizing whitespace there would be a
+# silent edit to someone else's writing and would conflict with every future
+# merge from upstream.
+#
+# The exclusion is repeated per hook on purpose. A repo-level `exclude` is
+# accepted by the YAML format but ignored in `prek.toml` — it warns and then
+# rewrites the very files it was meant to protect.
+[[repos]]
+repo = "builtin"
+hooks = [
+    { id = "trailing-whitespace", args = ["--markdown-linebreak-ext=md"], exclude = '^(learning-opportunities|orient)/' },
+    { id = "end-of-file-fixer", exclude = '^(learning-opportunities|orient)/' },
+    { id = "mixed-line-ending", args = ["--fix=lf"], exclude = '^(learning-opportunities|orient)/' },
+    { id = "fix-byte-order-marker", exclude = '^(learning-opportunities|orient)/' },
+]
+
+# Hooks that only report. These run everywhere, upstream content included,
+# because finding a problem is not the same as rewriting the file.
+[[repos]]
+repo = "builtin"
+hooks = [
+    # The release process depends on these parsing: a broken plugin.json or
+    # marketplace.json disables the plugin at load time rather than failing
+    # loudly. `pretty-format-json` is deliberately absent — it would reflow
+    # hand-maintained manifests into a diff nobody asked for.
+    { id = "check-json" },
+    { id = "check-toml" },
+    { id = "check-merge-conflict" },
+    { id = "check-added-large-files" },
+    { id = "detect-private-key" },
+    { id = "forbid-new-submodules" },
+    # The hook ships to Windows users, where a case-insensitive filesystem
+    # turns two paths differing only in case into one file and the reserved
+    # device names (`aux`, `con`, `nul`) cannot be checked out at all.
+    { id = "check-case-conflict" },
+    { id = "check-illegal-windows-names" },
+    # A hook script that lost its exec bit fails as silently as the quoting
+    # bug this fork was started over.
+    { id = "check-executables-have-shebangs" },
+    { id = "check-shebang-scripts-are-executable" },
+]
+
+# The repository's own regression suite, scoped to the hook directory so a
+# documentation commit costs nothing. When the hook itself changes, this is
+# exactly the moment the suite is worth its runtime.
+[[repos]]
+repo = "local"
+hooks = [
+    { id = "hook-regression-suite", name = "learning-opportunities-auto regression suite", entry = "learning-opportunities-auto/hooks/test-post-tool-use.sh", language = "system", files = '^learning-opportunities-auto/hooks/', pass_filenames = false },
+]
