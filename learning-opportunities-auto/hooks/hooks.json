@@ -1,5 +1,15 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'script=\"${CLAUDE_PLUGIN_ROOT:-}/hooks/post-tool-use.sh\"; [ -f \"$script\" ] && exec bash \"$script\" || exit 0'"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash",
