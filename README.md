@@ -31,32 +31,35 @@ Credit belongs to **[@vosechu](https://github.com/vosechu)** ([#20], [#21]), **[
 [#21]: https://github.com/DrCatHicks/learning-opportunities/pull/21
 [#18]: https://github.com/DrCatHicks/learning-opportunities/issues/18
 
-## What's fixed (`learning-opportunities-auto` 1.1.1)
+## What's fixed (`learning-opportunities-auto` 1.1.2)
 
 | | Change |
 |---|---|
 | **Commit detection** | Reads only the command field, never the tool's output, and matches an anchored `git`/`jj` invocation instead of a loose substring. `git status`, `git log --grep=commit`, and `echo "how to git commit"` no longer report a commit |
+| **Multi-line commands** | *(unfiled upstream)* A commit on any line but the first was not recognized **at all** — `git add -A` and `git commit -m "…"` on consecutive lines, the shape agents write by habit and the shape of any script handed to the Bash tool. The line break arrives as the JSON escape `\n`, so every later line read as a continuation of the first, where nothing anchors `git`. Nothing was emitted, silently. Recognizing later lines then means reading heredoc bodies as commands, so those are excluded — a `cat <<EOF` writing a script that contains `git commit` stays text. That exclusion follows the shell rather than approximating it: the terminator matches as `bash` matches it (`<<-` strips leading tabs, a plain `<<` strips nothing, neither strips anything trailing), `<<\EOF` counts as quoted, a line opening several heredocs has every body skipped, and a `<<<` herestring, an arithmetic `$((a<<b))`, or a `<<` inside a comment opens none — that last one mattered most, since a phantom heredoc never closes and swallows every line below it, including a real commit. Backslash continuations are spliced onto the line above, as the shell does — but a backslash inside a comment is comment text, so `echo done # example \` ends there rather than absorbing the commit below it. Only a *quoted* delimiter makes a heredoc body inert; under a plain `<<EOF` the shell substitutes commands in the body, so a `$(git commit)` in there is a commit that really lands and is read as one — unless a backslash quotes it, which bash writes out literally |
 | **Quoted paths** | *(unfiled upstream)* `git -C "/other repo" commit` — the form agents use whenever a path might contain a space — was not recognized as a commit **at all**. The payload is JSON, so the quotes arrive escaped, and the escaping was never decoded before matching. Nothing was emitted, silently |
 | **Jujutsu support** | `jj commit` is recognized alongside `git commit` ([#12]). Colocated `jj` writes real git commits, and the skill is VCS-agnostic anyway |
 | **Failed commits** | A rejected commit — failing pre-commit hook, nothing staged — left `HEAD` on the *previous* commit and nudged about already-finished work. `HEAD`'s committer date now confirms the commit landed |
-| **Which repo** | *(unfiled upstream)* A commit landing anywhere other than the session's working directory was checked against the wrong repository, so a real commit could be dropped because an unrelated `HEAD` looked stale. The target is now read off the command — `-C`, `-R`, `--git-dir`, `--work-tree`, a leading `cd`/`pushd` — including bare and out-of-tree layouts, where previously no SHA resolved and both the freshness check and the de-duplication were skipped |
+| **Which repo** | *(unfiled upstream)* A commit landing anywhere other than the session's working directory was checked against the wrong repository, so a real commit could be dropped because an unrelated `HEAD` looked stale. The target is now read off the command — `-C`, `-R`, `--git-dir`, `--work-tree`, a leading `cd`/`pushd` — including bare and out-of-tree layouts, where previously no SHA resolved and both the freshness check and the de-duplication were skipped. Among several `cd`s the winner is the last one that *could have succeeded*: a `cd` to a missing directory fails and leaves the shell where it was. `..` folds logically, as the shell folds it, so `cd link` then `cd ..` returns to the directory holding the symlink instead of following it to the parent of its target |
 | **Offer budget** | Repeated hook fires for one commit could burn the whole two-offer session budget. Emitted commits are de-duplicated per session, and a corrupt state file no longer disables the rate limit |
 | **Parallel hooks** | *(unfiled upstream)* Tool calls run in parallel, and the session state was read and written without a lock. Six concurrent hooks on one commit reliably emitted **six** nudges, on every run; the cap could be overrun the same way. Now one. Locking is `mkdir`-based — `flock` is util-linux and absent on stock macOS |
 | **Nudge precision** | The nudge now names its commit as `(<sha>: <subject>)`, so the skill has a concrete topic instead of inferring what was committed |
 | **Hook never firing** | The Claude Code hook expanded `${CLAUDE_PLUGIN_ROOT}` **unquoted**, so a plugin path containing a space word-split and `bash` exited 127 — the hook never ran and nothing said why. Windows is where this bites, `C:\Users\First Last\` being the ordinary shape there. Reported as [#18], where it's attributed to Claude Code not expanding the variable; it does expand it, and the missing quotes are the actual fault |
 | **Codex hook path** | *(unfiled upstream)* The Codex hook resolved its script from a cache path with the plugin version **hardcoded**, so every release silently disabled the hook until that string was bumped in lockstep — and a local dev install was never found at all. The version is now resolved at runtime, matching how Codex picks the active one: a `local` dev install if present, otherwise the highest installed version |
 
-A regression suite lives at [`learning-opportunities-auto/hooks/test-post-tool-use.sh`](learning-opportunities-auto/hooks/test-post-tool-use.sh) — 74 assertions, no dependencies beyond bash:
+A regression suite lives at [`learning-opportunities-auto/hooks/test-post-tool-use.sh`](learning-opportunities-auto/hooks/test-post-tool-use.sh) — 130 assertions, no dependencies beyond bash:
 
 ```
 ./learning-opportunities-auto/hooks/test-post-tool-use.sh
 ```
 
-The upstream hook fails 41 of them.
+The upstream hook fails 74 of them.
 
 ### Design constraints kept
 
 Upstream's hook header promises *"no external dependencies beyond bash and standard Unix tools"*, and an earlier fix attempt ([#21]) was withdrawn for reaching for `jq`. Everything here stays within `grep`/`sed`/`tr`, and detection keeps the original whole-payload grep as a fast pre-filter so the hot path — every Bash call that *isn't* a commit — stays as cheap as it was.
+
+**bash 3.2 still runs it.** The hook is launched as `bash "$script"` off `PATH`, and on a stock macOS that resolves to `/bin/bash` 3.2.57 — Apple froze bash there in 2007 and never moved. Bash 4 syntax would not degrade gracefully; it is a parse error, so the hook would die on every Bash tool call. The suite enforces this rather than trusting it: when an old `bash` is present it parse-checks the hook and runs two cases end to end through it. That check earns its place — a `declare -A` injected as a probe **parses** fine under 3.2 and only fails at runtime, so the end-to-end case is what catches it. The one visible concession is the heredoc queue, a newline-delimited string rather than an array, because expanding an empty `${arr[@]}` under `set -u` is an error before bash 4.4.
 
 ## Installation
 
