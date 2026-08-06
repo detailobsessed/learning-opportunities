@@ -3,541 +3,438 @@ set -uo pipefail
 
 # learning-opportunities-auto: PostToolUse hook (matches Bash tool)
 #
-# Fires after every Bash tool use. Checks whether the command was a
-# `git commit` or `jj commit` and, if so, suggests that Claude offer a
-# learning exercise. The skill itself decides whether the commit's content
-# is worth an exercise — this hook just provides the nudge at the right
-# moment.
+# Fires after every Bash tool use. Decides whether the user just committed and,
+# if so, suggests that Claude offer a learning exercise. The skill itself
+# decides whether the commit's content is worth an exercise — this hook just
+# provides the nudge at the right moment.
 #
 # No external dependencies beyond bash and standard Unix tools.
+#
+# ---------------------------------------------------------------------------
+# How this decides a commit happened
+#
+# It does not read the command. Earlier versions matched an anchored
+# `git`/`jj` invocation in the Bash tool's command text, which meant
+# reimplementing shell lexing in a text scanner: heredoc bodies are not
+# commands, comments end commands, backslashes continue them, unquoted heredoc
+# bodies still run their command substitutions unless the opener is escaped,
+# and `cd` resolves logically rather than physically. Twelve rounds of review
+# found twelve divergences from bash, one of them a false positive introduced
+# by the fix for the round before it. The domain is unbounded; the scanner was
+# never going to converge.
+#
+# `PostToolUse` fires *after* the tool ran, so the effect is observable
+# directly: ask whether HEAD moved. A commit is a HEAD that
+#
+#   1. we have not already accounted for this session,
+#   2. HEAD's reflog does not say something other than committing put it
+#      there, and
+#   3. was written during this session, per its committer date.
+#
+# Conditions 2 and 3 are what separate a commit from a `git checkout
+# other-branch`, a `git reset --hard HEAD~1`, or a `git pull` that fast-forwards
+# onto somebody else's work — all of which move HEAD to a commit that already
+# existed.
+#
+# Condition 1 assumes the repository was baselined. `SessionStart` baselines the
+# session's own; a repository named by a hint arrives later and, unbaselined,
+# has a HEAD that is unaccounted for without having moved at all — a read-only
+# `git -C ../other status` is enough to put one on the list. So the same script
+# also runs on `PreToolUse`, where the command has not run yet and HEAD is
+# therefore where the command found it, and records the ones it is meeting for
+# the first time. A repository that reaches `PostToolUse` still unmet was not
+# baselined by either, and is recorded rather than reported.
+#
+# The reflog is consulted only to dismiss, and only for the reasons git writes
+# when no commit was created: `checkout:`, `reset:`, anything ending in
+# `Fast-forward`, and a `rebase (finish)` with nothing picked below it. A
+# merge that actually merges, a rebase that actually rewrites, a cherry-pick,
+# a revert and an amend all write real commits and carry their own reasons.
+# Where the reflog is off or absent it says nothing and the date decides alone,
+# which is what it did before condition 2 existed.
+#
+# The date is %ct rather than the author date, which `--amend` and `rebase`
+# preserve. It is the user's own clock and so cannot be the whole answer —
+# a pre-existing commit stamped in the second the session began is not older
+# than the baseline, and one stamped in the future never will be. Condition 2
+# is what covers both.
+#
+# Neither condition is reached on an ordinary tool call: HEAD is already in the
+# seen set by then, and condition 1 exits first.
+#
+# What this buys beyond ending the scanner bugs: every commit no parser could
+# reach now counts. `SKIP=ruff git commit` and `env git commit` (an assignment
+# or `env` prefix moved `git` off the anchor), `git ci` and other aliases,
+# shell functions, and any script that commits somewhere inside itself —
+# `./deploy.sh`, `make release`, a pre-push hook.
+#
+# What it costs, in three parts.
+#
+# One `git rev-parse` per Bash tool call in place of a grep.
+#
+# The semantics shift from "you typed a commit command" to "a commit happened
+# since I last looked", so a commit made in a GUI client between two tool calls
+# now nudges too. The per-session de-duplication and the two-offer cap bound
+# that, and it is arguably the more useful reading anyway.
+#
+# And a genuine regression: a *non-colocated* Jujutsu repo has no .git for
+# these queries to read, so it is no longer detected. Colocated `jj` — the
+# default, and what `jj git init --colocate` produces — writes real commits to
+# a real .git and works exactly as before, with the commit named in the nudge.
+# Only the non-colocated layout is dropped, deliberately: recovering it means
+# either shelling out to `jj` and pinning its template syntax, or keeping a
+# text matcher alive for one narrow path, and neither is worth reopening the
+# approach this rewrite exists to close.
+# ---------------------------------------------------------------------------
 
 INPUT=$(cat)
 
 # ---------------------------------------------------------------------------
-# Check if this was a commit.
-#
-# Both `git commit` and `jj commit` count. Jujutsu is git-compatible and in
-# its default colocated mode operates directly on a standard .git directory,
-# so `jj commit` produces a real git commit. The learning-opportunities skill
-# is VCS-agnostic anyway — the meaningful event is "the user finalized a chunk
-# of work", not which binary they typed.
-#
-# Claude Code sends shell text in a "command" field; Codex can send it in a
-# "cmd" field. The payload also carries the tool's *output* in "tool_response",
-# so matching against the whole payload conflates the two: `git status` prints
-# "nothing to commit", `git log` prints "commit <sha>", and both used to be
-# reported to the model as "the user just committed code".
-#
-# Two stages:
-#   1. A cheap superset grep over the raw payload as a fast early exit. Any
-#      real commit necessarily contains this pattern, so a non-match means we
-#      can bail immediately without doing the more expensive extraction. This
-#      keeps the hot path (every Bash call that isn't a commit) fast.
-#   2. Extract each "command"/"cmd" string value and test it on its own, so
-#      tool output is never scanned.
-#
-# A command may be several lines — `git add -A` and `git commit -m "..."` on
-# consecutive lines is how agents habitually write one, and a shell script
-# passed to the tool arrives the same way. In JSON those line breaks are the
-# two-character escape `\n`, so they are decoded to real newlines below and
-# every line is then matched on its own.
-# ---------------------------------------------------------------------------
-
-if ! echo "$INPUT" | grep -Eq '"(command|cmd)".*(git|jj).*commit'; then
-  exit 0
-fi
-
-# Anchored match for a real `git commit` / `jj commit` invocation:
-#
-#   (^[[:space:]]*|[;&|`({][[:space:]]*|\$\([[:space:]]*)
-#     Start of a line — grep matches line by line, so with the newlines decoded
-#     this covers every line of a multi-line command — or immediately after a
-#     shell separator (`;`, `&`, `|`, backtick, `(`, `{`) or a `$(` command
-#     substitution. Requiring a separator rather than mere whitespace is what
-#     rejects `git` appearing inside a quoted argument, e.g.
-#     `echo "how to git commit"`. Leading indentation is skipped, so `git` is
-#     still found on an indented line of a script.
-#
-#   (git|jj)
-#     The literal command name. The anchor above keeps `foogit`/`git-foo` out.
-#
-#   ([[:space:]]+-[^[:space:]"]+("[^"]*"|'[^']*')?([[:space:]]+("[^"]*"|'[^']*'|[^-[:space:]"][^[:space:]"]*))?)*
-#     Zero or more global-flag blocks: `-flag`, optionally followed by a value
-#     that doesn't itself start with `-`. Lets `git -C /repo commit` and
-#     `jj -R /repo commit` match while keeping `git log --grep=commit` and
-#     `jj log -r commit` out — `log` is not a flag, so the run of flag blocks
-#     cannot bridge it to `commit`.
-#
-#     A value may be quoted, in both the `--opt "value"` and `--opt="value"`
-#     positions, because a path that might contain a space usually is quoted.
-#     Without those alternatives the quote terminates the flag block and
-#     `git -C "/other repo" commit` is not recognized as a commit at all.
-#
-#   [[:space:]]+commit
-#     The subcommand.
-#
-#   ([[:space:]";|&)]|$|\\)
-#     Terminator: whitespace, quote, separator, end of string, or a JSON
-#     backslash escape. Keeps `git commit-tree` from matching.
-#
-# Adapted from @jasikpark's approach in DrCatHicks/learning-opportunities#15.
-COMMIT_RE='(^[[:space:]]*|[;&|`({][[:space:]]*|\$\([[:space:]]*)(git|jj)([[:space:]]+-[^[:space:]"]+("[^"]*"|'"'"'[^'"'"']*'"'"')?([[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^-[:space:]"][^[:space:]"]*))?)*[[:space:]]+commit([[:space:]";|&)]|$|\\)'
-
-# Drop the lines that cannot start a command: heredoc bodies, and lines that
-# continue the previous one. Both are text the shell never runs as a command,
-# but with the line breaks decoded they start at column zero and would anchor
-# exactly like a real invocation.
-#
-# A line whose predecessor ends in an odd number of backslashes is a
-# continuation — `echo preparing to \` then `git commit` passes `git` and
-# `commit` to echo. An even count is escaped backslashes, not a continuation.
-# Such a line is spliced onto the one above rather than dropped, because the
-# joined text is what the shell runs: dropping it would lose the commit in
-# `env \` + `git commit -m x`, and a missed nudge is the failure this hook
-# exists to prevent. Joined, a continuation behaves exactly like the same
-# command written on one line.
-#
-# The heredoc's opening line is kept, because
-# `git commit -m "$(cat <<EOF ... EOF)"` is a real commit that merely takes
-# its message from a heredoc.
-#
-# `<<WORD`, `<<-WORD`, and a quoted `<<"WORD"` / `<<'WORD'` / `<<\WORD` all
-# start one, and one line can start several. The terminator is matched as the
-# shell matches it: leading tabs stripped after `<<-`, nothing stripped after
-# a plain `<<`, and nothing trailing stripped after either.
-#
-# The delimiter runs to the end of the word, dots and hyphens included:
-# capturing only `END` from `<<END-MARKER` means the real terminator never
-# matches, the heredoc never closes, and every line after it — including a
-# real commit — is swallowed.
-#
-# Two things are kept out of it. The leading (^|[^<]) rejects a `<<<`
-# herestring, whose word is data rather than a delimiter. The trailing
-# boundary rejects an arithmetic left-shift, `$((a<<b))`, where `b))` would
-# otherwise be read as a delimiter that no later line can match; a real
-# delimiter is followed by whitespace, a redirect, a separator, or the end of
-# the line. Both mistakes fail the same way — swallowing the rest of the
-# command — which is why they are worth excluding by construction.
-#
-# `<<` inside a quoted string still reads as a heredoc here, so a command that
-# prints the text `<<EOF` could suppress a commit on a later line. That
-# direction — a missed nudge on a contrived command — is the safe one.
-#
-# What is deliberately *not* tracked is quoting state across lines. A
-# multi-line single-quoted string — `printf '%s' 'notes:` then
-# `git commit -m x'` — still reads as a commit. Tracking it properly means
-# tracking comments across lines as well, and one `# don't do this` would then
-# read as an open quote and suppress a real commit on the next line. (The
-# comment handling below is a different thing: it looks at one line at a time
-# and only to decide whether a `<<` on it opens a heredoc.) That trades a rare
-# spurious offer — already capped at two per session and gated on a fresh
-# HEAD — for the silently missed nudge this hook exists to prevent. Wrong
-# direction, and declined deliberately when automated review raised it.
-# Fold `.` and `..` out of a path textually, which is what the shell means by
-# resolving `cd` *logically* — its default. `cd link` then `cd ..` returns to
-# the directory holding `link`, not to the parent of whatever `link` points at.
-# Joining the raw components instead and handing `…/link/..` to `git -C` lets
-# the kernel resolve it physically, through the symlink, and git then reads a
-# different repository — the wrong-repo failure this block exists to avoid.
-#
-# Split by parameter expansion rather than `IFS=/` word splitting, which would
-# glob-expand a component containing `*`.
-normalize_logical() {
-  local path="$1" part out=""
-  while [[ -n "$path" ]]; do
-    part="${path%%/*}"
-    if [[ "$part" == "$path" ]]; then path=""; else path="${path#*/}"; fi
-    case "$part" in
-      ''|.) ;;
-      ..)   out="${out%/*}" ;;
-      *)    out="$out/$part" ;;
-    esac
-  done
-  printf '%s' "${out:-/}"
-}
-
-# The contents of every command substitution on a line, one per output line.
-# An unquoted heredoc body is not inert: the shell expands `$(...)` and
-# backticks in it and runs what is inside, so that text is code even though the
-# line around it is not. Only the substituted text is returned — the prose
-# around it stays out, so a body line reading `then ; git commit` is not
-# mistaken for a command while `$(git commit -m x)` is found.
-#
-# Non-nested, and the inner `)`/backtick wins where they nest. That truncates
-# `$(git commit -m "$(date)")` to `git commit -m "$(date`, which still matches;
-# a nesting this deep inside a heredoc body is not worth a character-by-
-# character scan on every line.
-command_substitutions() {
-  local s="$1" subs="" inner before_d before_b before esc kind
-  while :; do
-    before_d="${s%%\$(*}"
-    before_b="${s%%\`*}"
-    if [[ "$s" == *'$('* ]] && { [[ "$s" != *\`* ]] || (( ${#before_d} < ${#before_b} )); }; then
-      kind=dollar; before="$before_d"
-    elif [[ "$s" == *\`* ]]; then
-      kind=backtick; before="$before_b"
-    else
-      break
-    fi
-    # A backslash quotes the opener, so `\$(git commit -m x)` in a body is
-    # written out literally and runs nothing. An even run of backslashes is
-    # escaped backslashes and the opener still opens. Skipping past a quoted
-    # opener rather than stopping keeps a real substitution later on the same
-    # line findable.
-    esc="${before##*[!\\]}"
-    if [[ "$kind" == dollar ]]; then
-      s="${s#*\$(}"
-      (( ${#esc} % 2 == 1 )) && continue
-      inner="${s%%)*}"
-      s="${s#*)}"
-    else
-      s="${s#*\`}"
-      (( ${#esc} % 2 == 1 )) && continue
-      inner="${s%%\`*}"
-      s="${s#*\`}"
-    fi
-    subs+="$inner"$'\n'
-  done
-  printf '%s' "$subs"
-}
-
-strip_noncommand_lines() {
-  local line tail rest head dash delim quoted body scan comment_head dquotes squotes
-  local tab=$'\t' squote="'" pending="" continued="" out=""
-  local heredoc_re='(^|[^<])<<(-?)[[:space:]]*("|'"'"'|\\)?([A-Za-z_][A-Za-z0-9_.-]*)("|'"'"'|\\)?([[:space:];|&<>]|$)'
-  while IFS= read -r line; do
-    if [[ -n "$pending" ]]; then
-      head="${pending%%$'\n'*}"
-      dash="${head%%$tab*}"
-      delim="${head##*$tab}"
-      quoted="${head#*$tab}"
-      quoted="${quoted%%$tab*}"
-      # The terminator is matched the way the shell matches it. `<<-` strips
-      # leading tabs, and only tabs; a plain `<<` strips nothing; neither
-      # strips anything trailing. Accepting a space-indented or
-      # trailing-space `EOF` closes the heredoc early, and the body lines
-      # below it — `git commit -m x` among them — then read as commands.
-      if [[ "$dash" == - ]]; then
-        [[ "${line#"${line%%[!$tab]*}"}" == "$delim" ]] && pending="${pending#*$'\n'}"
-      else
-        [[ "$line" == "$delim" ]] && pending="${pending#*$'\n'}"
-      fi
-      # A quoted delimiter — `<<'EOF'`, `<<"EOF"`, `<<\EOF` — makes the body
-      # literal text and there is nothing in it to run. An unquoted one does
-      # not: the shell substitutes commands in the body before writing it out,
-      # so a `$(git commit -m x)` there is a commit that really happens. Keep
-      # the substituted text alone; the rest of the body stays out.
-      if [[ -z "$quoted" ]]; then
-        body=$(command_substitutions "$line")
-        [[ -n "$body" ]] && out+="$body"
-      fi
-      continue
-    fi
-    if [[ -n "$continued" ]]; then
-      # Splice onto the previous line, exactly as the shell does: the
-      # backslash and the newline both go, and what is left is one command.
-      out="${out%$'\n'}"
-      out="${out%\\}"
-    fi
-    out+="$line"$'\n'
-    # A `#` that starts a comment ends the command, so `# example: cat <<EOF`
-    # opens nothing. Without this the phantom heredoc never closes and every
-    # line below it is dropped, including a real commit — the silent miss this
-    # hook exists to prevent.
-    #
-    # This has to come before the continuation check below, not after it. A
-    # backslash inside a comment is part of the comment: bash runs
-    # `echo done # example \` and the line after it as two separate commands,
-    # and splicing them would strip the second line's anchor and lose a commit
-    # sitting on it.
-    #
-    # The `#` has to be unquoted to start a comment, and quoting is only
-    # tracked within this one line: the text before the `#` counts as a
-    # comment marker when its quotes balance and it ends at a word boundary.
-    # `git commit -m "fix #3"` leaves an odd double quote open, so the whole
-    # line is used as before. Erring that way costs at most the heredoc
-    # handling that was already in place.
-    scan="$line"
-    comment_head="${line%%#*}"
-    if [[ "$comment_head" != "$line" ]]; then
-      dquotes="${comment_head//[!\"]/}"
-      squotes="${comment_head//[!$squote]/}"
-      if (( ${#dquotes} % 2 == 0 && ${#squotes} % 2 == 0 )) \
-         && [[ -z "$comment_head" || "$comment_head" == *[[:space:]] ]]; then
-        scan="$comment_head"
-      fi
-    fi
-    # The trailing run of backslashes, which is the whole line when the line is
-    # nothing but backslashes. An odd count continues the command; an even count
-    # is escaped backslashes and ends it. Counted on the pre-comment text for
-    # the reason given above.
-    tail="${scan##*[!\\]}"
-    if (( ${#tail} % 2 == 1 )); then continued=1; else continued=""; fi
-    # One line can open several heredocs — `cat <<A; cat <<B`, and also
-    # `cat <<FIRST <<SECOND`, whose bodies the shell reads in order however
-    # little sense the redirect makes. Queue every opener on the line, in
-    # order, rather than only the first.
-    rest="$scan"
-    while [[ "$rest" =~ $heredoc_re ]]; do
-      pending+="${BASH_REMATCH[2]}$tab${BASH_REMATCH[3]}$tab${BASH_REMATCH[4]}"$'\n'
-      rest="${rest#*"${BASH_REMATCH[0]}"}"
-    done
-  done <<< "$1"
-  printf '%s' "$out"
-}
-
-# Pull out every "command"/"cmd" JSON string value. The inner
-# ([^"\\]|\\.)* consumes escaped quotes so a value like
-# "git commit -m \"msg\"" is captured whole rather than truncated at the
-# first inner quote. Testing every extracted value (rather than only the
-# first) means we don't depend on tool_input preceding tool_response in the
-# payload — a key order the hook contract does not guarantee.
-FOUND_COMMIT=0
-MATCHED_CMD=""
-PRE_CMD=""
-while IFS= read -r cmd; do
-  [[ -z "$cmd" ]] && continue
-  # The payload is JSON, so the command arrives escaped: a quoted path written
-  # `git -C "/other repo" commit` reaches us as `git -C \"/other repo\" commit`.
-  # Undo that here, once, so neither the pattern above nor the redirect parsing
-  # further down has to reason about backslashes — left escaped, the quotes
-  # defeat both, and the hook silently falls back to the session cwd.
-  #
-  # `\\` is folded to a sentinel first so an escaped backslash sitting right
-  # before a quote (`...\\"`) isn't misread as an escaped quote. That also
-  # keeps a literal backslash-n in the command — `printf 'a\nb'`, which the
-  # payload escapes as `\\n` — from being turned into a line break here.
-  #
-  # Line breaks and tabs become real characters, because they are separators
-  # the pattern has to see: `git add -A\ngit commit -m "..."` is one command
-  # with two lines, and left as the two-character `\n` the second line reads
-  # as a continuation of the first, where nothing anchors `git`. A `\r` is
-  # folded into a newline as well — as a separator the two are equivalent
-  # here, and a CRLF payload then splits like any other.
-  cmd="${cmd//\\\\/$'\001'}"
-  cmd="${cmd//\\\"/\"}"
-  cmd="${cmd//\\n/$'\n'}"
-  cmd="${cmd//\\r/$'\n'}"
-  cmd="${cmd//\\t/$'\t'}"
-  cmd="${cmd//$'\001'/\\}"
-  cmd=$(strip_noncommand_lines "$cmd")
-  match_line=$(echo "$cmd" | grep -nE "$COMMIT_RE" | head -1 | cut -d: -f1)
-  if [[ -n "$match_line" ]]; then
-    FOUND_COMMIT=1
-    # The redirect parsing below reads the options of the commit invocation
-    # itself, so it gets that line rather than the whole command: a `-C` or
-    # `--git-dir` belonging to some unrelated line of a multi-line script
-    # would otherwise send the queries to a different repository.
-    MATCHED_CMD=$(echo "$cmd" | sed -n "${match_line}p")
-    # Everything up to and including that line, for the `cd` fallback: a
-    # directory change only moves the shell for what comes after it, so a `cd`
-    # below the commit is irrelevant and must not be read.
-    PRE_CMD=$(echo "$cmd" | sed -n "1,${match_line}p")
-    break
-  fi
-done < <(echo "$INPUT" | grep -oE '"(command|cmd)":"([^"\\]|\\.)*"' | sed -E 's/^"(command|cmd)":"//; s/"$//')
-
-if [[ "$FOUND_COMMIT" -eq 0 ]]; then
-  exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# Extract session_id for rate limiting. It's a top-level UUID — no escaped
-# quotes or nesting to worry about, so basic grep/sed is safe.
+# Session identity and working directory. Both are top-level JSON strings with
+# no escaped quotes or nesting, so basic grep/sed is safe.
 # ---------------------------------------------------------------------------
 
 SESSION_ID=$(echo "$INPUT" | grep -o '"session_id":"[^"]*"' | head -1 | sed 's/"session_id":"//;s/"$//')
-
-if [[ -z "$SESSION_ID" ]]; then
-  exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# Identify the commit, if we can.
-#
-# Everything in this block is best-effort. A colocated Jujutsu repo has a
-# real .git directory and answers these queries, but a non-colocated one does
-# not, and neither does a repo we can't resolve a working directory for. In
-# those cases we fall through with an empty SHA and still nudge — just
-# without the extra precision below. Failing closed here would silently
-# disable the hook for those users.
-# ---------------------------------------------------------------------------
+[[ -z "$SESSION_ID" ]] && exit 0
 
 CWD=$(echo "$INPUT" | grep -o '"cwd":"[^"]*"' | head -1 | sed 's/"cwd":"//;s/"$//')
 if [[ -z "$CWD" || ! -d "$CWD" ]]; then
   CWD="$PWD"
 fi
 
-# The payload's cwd is the session's directory, which is not necessarily where
-# the commit landed. `git -C /other/repo commit` and `cd /other/repo &&
-# git commit` both target somewhere else, and querying the session directory
-# would then read an unrelated repository's HEAD — suppressing a real commit
-# because the wrong HEAD looks stale, or nudging with the wrong SHA.
-#
-# Redirection is read back off the command: an explicit -C (git) or -R (jj)
-# wins, since those override the working directory; otherwise a leading `cd`.
-# Relative paths resolve against the session cwd. Anything unparseable or
-# missing just leaves the session cwd in place.
-REPO_DIR="$CWD"
-
-# MATCHED_CMD was JSON-unescaped when it was extracted, so quoting here is
-# ordinary shell quoting.
-#
-# Value of an option in the matched command, accepting either `--opt value` or
-# `--opt=value`, and single- or double-quoted values.
-opt_value() {
-  printf '%s' "$MATCHED_CMD" \
-    | sed -nE "s/.*[[:space:]]-{1,2}($1)[=[:space:]][[:space:]]*(\"[^\"]*\"|'[^']*'|[^[:space:]]+).*/\2/p" \
-    | head -1
-}
-
-# Strip one layer of quoting and resolve a relative path against the session
-# cwd, which is where the shell would have resolved it.
-unquote() {
-  local v="$1"
-  v="${v%\"}"; v="${v#\"}"
-  v="${v%\'}"; v="${v#\'}"
-  printf '%s' "$v"
-}
-
-# Quote removal plus resolution against the session cwd, which is the right
-# base for -C, -R, --git-dir and --work-tree: those take effect wherever the
-# shell already is. A chain of `cd`s is the exception and resolves each step
-# against the one before it, so that loop unquotes without resolving.
-unquote_path() {
-  local v
-  v=$(unquote "$1")
-  [[ -n "$v" && "$v" != /* ]] && v="$CWD/$v"
-  printf '%s' "$v"
-}
-
-# How to point git at the repository the commit actually landed in.
-#
-# --git-dir and --work-tree are passed straight through rather than collapsed
-# into a single directory: they are independent in an out-of-tree or bare
-# layout (`git --git-dir=/srv/meta/project.git --work-tree=/srv/work commit`),
-# and keeping only one of them would send the queries below to a directory
-# that is not a repository at all. Otherwise the working directory is enough:
-# -C (git) and -R (jj) change where the command looks, and a leading cd or
-# pushd moves the shell before any of it runs.
-#
-# GIT_LOC is always non-empty — expanding an empty array under `set -u` is an
-# error in the bash 3.2 that ships with macOS.
-WORK_TREE=$(unquote_path "$(opt_value 'work-tree')")
-GIT_DIR_OPT=$(unquote_path "$(opt_value 'git-dir')")
-
-if [[ -n "$GIT_DIR_OPT" && -e "$GIT_DIR_OPT" ]]; then
-  GIT_LOC=(--git-dir "$GIT_DIR_OPT")
-  [[ -n "$WORK_TREE" && -d "$WORK_TREE" ]] && GIT_LOC+=(--work-tree "$WORK_TREE")
-elif [[ -n "$WORK_TREE" && -d "$WORK_TREE" ]]; then
-  GIT_LOC=(-C "$WORK_TREE")
-else
-  redirect=$(unquote_path "$(opt_value 'C|R')")
-  if [[ -z "$redirect" ]]; then
-    # This one reads every line up to the commit, not just the commit's own: a
-    # `cd` on an earlier line of a multi-line script moves the shell for
-    # everything that follows, exactly as `cd /repo && git commit` does on one
-    # line. The last one that *could have succeeded* wins — `cd /a`, then
-    # `cd /b`, then commit lands in /b — and a `cd` below the commit was
-    # excluded from PRE_CMD.
-    #
-    # Existence is what makes a cd the winner, not position. A cd to a missing
-    # directory fails and leaves the shell where it was, so `cd /repo` then
-    # `cd /gone` then commit still lands in /repo; taking /gone and then
-    # discarding it for not existing would fall back to the session cwd and
-    # attribute the commit to a repository it was never made in.
-    #
-    # Relative arguments compound, so each is resolved against the directory
-    # the previous cd established rather than against the session cwd: `cd a`
-    # then `cd b` lands in <cwd>/a/b, and testing <cwd>/b instead finds an
-    # unrelated directory or none at all. `cd_base` walks forward exactly as
-    # the shell's working directory does.
-    #
-    # This is an approximation either way — a cd inside a branch that never
-    # runs still counts here — but one that errs toward the directory the
-    # commit most likely landed in.
-    cd_base="$REPO_DIR"
-    while IFS= read -r cd_arg; do
-      cd_arg=$(unquote "$cd_arg")
-      [[ -z "$cd_arg" ]] && continue
-      case "$cd_arg" in
-        /*) cd_candidate=$(normalize_logical "$cd_arg") ;;
-        *)  cd_candidate=$(normalize_logical "$cd_base/$cd_arg") ;;
-      esac
-      if [[ -d "$cd_candidate" ]]; then
-        cd_base="$cd_candidate"
-        redirect="$cd_candidate"
-      fi
-    done <<< "$(printf '%s' "$PRE_CMD" \
-      | sed -nE 's/^[[:space:]]*(cd|pushd)[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+).*/\2/p')"
-  fi
-  # An unresolvable path leaves the session cwd in place rather than guessing.
-  [[ -n "$redirect" && -d "$redirect" ]] && REPO_DIR="$redirect"
-  GIT_LOC=(-C "$REPO_DIR")
-fi
-
-SHA=$(git "${GIT_LOC[@]}" rev-parse --short HEAD 2>/dev/null) || SHA=""
-
-if [[ -n "$SHA" ]]; then
-  # Confirm the commit actually landed. A rejected `git commit` — failing
-  # pre-commit hook, nothing staged, empty message — leaves HEAD pointing at
-  # the *previous* commit, and nudging about already-finished work is worse
-  # than staying quiet. The committer date (%ct, not the author date, which
-  # `--amend` preserves) is set when the commit object is written, so a fresh
-  # HEAD means the command we just saw succeeded.
-  #
-  # The window has to be wide, because the hook fires only once the *whole*
-  # shell command finishes: `git commit -m x && npm test` can put minutes
-  # between the commit being written and this check running, and suppressing
-  # that nudge would lose exactly the learning moment the plugin exists for.
-  # A rejected commit normally leaves HEAD on work from a previous sitting,
-  # which is far older than this window, and the repeated-failure case is
-  # caught by the SHA de-dupe below regardless of timing. Erring wide trades
-  # a rare spurious nudge for not dropping real ones — the right direction
-  # for this plugin.
-  COMMIT_TS=$(git "${GIT_LOC[@]}" log -1 --format=%ct 2>/dev/null) || COMMIT_TS=""
-  if [[ -n "$COMMIT_TS" ]] && (( $(date +%s) - COMMIT_TS > 900 )); then
-    exit 0
-  fi
-fi
+EVENT=$(echo "$INPUT" | grep -o '"hook_event_name":"[^"]*"' | head -1 | sed 's/"hook_event_name":"//;s/"$//')
 
 # ---------------------------------------------------------------------------
-# Session state, both keyed on session ID in $TMPDIR and reset when the
-# session ends:
+# Session state, all keyed on session ID in $TMPDIR and reset when the session
+# ends:
 #
-#   .state  count of nudges emitted this session, capped at 2
-#   .seen   commit SHAs already nudged about
-#
-# The de-dupe matters because the hook can fire more than once for the same
-# commit — a retried tool call, or a command that runs `git commit` inside a
-# larger pipeline. Without it a single commit could consume the whole session
-# budget. It is skipped when the SHA is unknown, which degrades to the old
-# count-only behavior rather than to no rate limiting at all.
+#   .base    epoch second the session was first seen; a commit older than this
+#            predates the session and is not ours to nudge about
+#   .seen    commit SHAs already accounted for, including the baseline HEADs
+#   .watched git directories already under observation; one not listed here is
+#            being seen for the first time and has never been baselined
+#   .state   count of nudges emitted this session, capped at 2
 # ---------------------------------------------------------------------------
 
 SAFE_ID="${SESSION_ID//[^a-zA-Z0-9_-]/_}"
-STATE_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.state"
+BASE_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.base"
 SEEN_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.seen"
+WATCHED_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.watched"
+STATE_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.state"
 LOCK_DIR="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.lock"
 
-# Both files are read, tested, and then written, so concurrent hooks in one
-# session would otherwise interleave: two could clear the de-dupe check for
-# the same SHA before either records it, and two could read the same offer
-# count and each write count+1, losing an increment and overrunning the cap.
-# Tool calls do run in parallel, so this is reachable — committing in two
+# ---------------------------------------------------------------------------
+# Which repositories to look at.
+#
+# The session's working directory is the one that matters in nearly every
+# case, and it is the only one we can know without reading the command.
+#
+# The command text is still consulted, but only as a *hint* and only to add
+# repositories to the list — never to decide whether a commit happened. That
+# inverts the old failure mode. Under the scanner a misread `cd` sent the
+# lookup to the wrong repository and a real commit went unreported; here a
+# missed or bogus hint costs at most the extra coverage it would have added,
+# because the session's own repository is always checked, and a repository
+# whose HEAD did not move produces nothing regardless of how it got on the
+# list. So the hint deliberately ignores shell structure: it takes every
+# `-C`, `-R`, `--git-dir`, `--work-tree`, `cd` and `pushd` argument anywhere in
+# the text, including inside heredoc bodies and comments, in any order.
+# ---------------------------------------------------------------------------
+
+# A hint is resolved to the repository's *git directory*, not to its work tree,
+# and every query below addresses its repository with `--git-dir`. A
+# `--git-dir` hint names that directory itself, which is not a work tree, so
+# `git -C` on it fails outright for every query and the repository would never
+# be watched. Resolving this way round accepts either spelling: a work tree, a
+# `.git` directory, a `--separate-git-dir` location, and the `.git` *file* that
+# points at one all report the same absolute git directory, which also collapses
+# two spellings of one repository into a single watch entry. Nothing is lost by
+# dropping the work tree, because every query the hook runs — HEAD, its reflog,
+# its committer date, its subject — reads the git directory alone.
+repo_gitdir() {
+  git -C "$1" rev-parse --absolute-git-dir 2>/dev/null \
+    || git --git-dir="$1" rev-parse --absolute-git-dir 2>/dev/null
+}
+
+# Newline-delimited, and newline-*prefixed* so that every entry is bounded on
+# both sides. Without the leading newline the first entry has no left boundary
+# and `/repo/.git` reads as already present in a set holding only
+# `/other/repo/.git`, which would drop the second repository from the watch.
+# The readers below skip empty lines, so the extra leading newline costs
+# nothing.
+WATCH=$'\n'
+add_watch() {
+  local gitdir
+  # `-e` rather than `-d`: a repository with a separate git directory has a
+  # `.git` *file*, and that is a valid `--git-dir` argument.
+  [[ -e "$1" ]] || return 0
+  gitdir=$(repo_gitdir "$1") || return 0
+  [[ -z "$gitdir" ]] && return 0
+  case "$WATCH" in
+    *$'\n'"$gitdir"$'\n'*) ;;
+    *) WATCH+="$gitdir"$'\n' ;;
+  esac
+}
+
+add_watch "$CWD"
+
+# The payload is JSON, so a quoted path arrives escaped: `git -C "/other repo"`
+# reaches us as `git -C \"/other repo\"`. Undo that much, then pull the
+# arguments out. `\\` folds to a sentinel first so an escaped backslash before
+# a quote is not misread as an escaped quote.
+RAW=$(echo "$INPUT" | grep -oE '"(command|cmd)":"([^"\\]|\\.)*"' | sed -E 's/^"(command|cmd)":"//; s/"$//')
+if [[ -n "$RAW" ]]; then
+  RAW="${RAW//\\\\/$'\001'}"
+  RAW="${RAW//\\\"/\"}"
+  RAW="${RAW//\\n/$'\n'}"
+  RAW="${RAW//\\r/$'\n'}"
+  RAW="${RAW//\\t/$'\t'}"
+  RAW="${RAW//$'\001'/\\}"
+  # A relative hint is relative to wherever the shell had got to, not to where
+  # it started, so `cd parent && cd child` means `parent/child`. LOGICAL tracks
+  # that as the cd/pushd hints go by. It is a guess — a `cd` may have failed, or
+  # sat in a branch that never ran — but a wrong guess only adds a directory
+  # that is not a repository or whose HEAD did not move, and both cost nothing.
+  # The session's CWD stays in the running too, for the same reason.
+  LOGICAL="$CWD"
+  while IFS= read -r hint; do
+    [[ -z "$hint" ]] && continue
+    # Keep the keyword: only cd/pushd move the shell, the flags do not.
+    kind=$(printf '%s' "$hint" | sed -E 's/^[^-a-zA-Z]*(-C|-R|--git-dir|--work-tree|cd|pushd).*/\1/')
+    # Strip the flag or keyword and the separator, then one layer of quoting.
+    hint=$(printf '%s' "$hint" | sed -E 's/^[^-a-zA-Z]*(-C|-R|--git-dir|--work-tree|cd|pushd)[[:space:]=]+//')
+    hint="${hint%\"}"; hint="${hint#\"}"
+    hint="${hint%\'}"; hint="${hint#\'}"
+    [[ -z "$hint" ]] && continue
+    case "$hint" in
+      /*)
+        add_watch "$hint"
+        [[ "$kind" == cd || "$kind" == pushd ]] && LOGICAL="$hint"
+        ;;
+      *)
+        add_watch "$LOGICAL/$hint"
+        add_watch "$CWD/$hint"
+        # `..` off the accumulated path textually, which is how the shell reads
+        # it: `cd link` then `cd ..` returns to the directory holding the
+        # symlink, where letting git resolve `link/..` lands at the parent of
+        # its target instead. Both are watched; only one of them can be right,
+        # and neither is expensive to be wrong about.
+        [[ "$hint" == ".." ]] && add_watch "${LOGICAL%/*}"
+        if [[ "$kind" == cd || "$kind" == pushd ]]; then
+          case "$hint" in
+            .)  ;;
+            ..) LOGICAL="${LOGICAL%/*}" ;;
+            *)  LOGICAL="$LOGICAL/$hint" ;;
+          esac
+        fi
+        ;;
+    esac
+  done < <(printf '%s' "$RAW" | grep -oE '(^|[^[:alnum:]_./-])(-C|-R|--git-dir|--work-tree|cd|pushd)[[:space:]=]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:];&|"]+)')
+fi
+
+# ---------------------------------------------------------------------------
+# Baseline. The first time we see a session, every watched HEAD is recorded as
+# already accounted for and the clock starts. Nothing is emitted: we cannot
+# tell whether a commit sitting at HEAD was made a moment ago by this very tool
+# call or an hour ago before the session opened.
+#
+# `hooks.json` also runs this on SessionStart precisely so the baseline is in
+# place before the first Bash call, which closes that gap for the ordinary
+# case of committing early in a session.
+# ---------------------------------------------------------------------------
+
+record_heads() {
+  local gitdir sha
+  while IFS= read -r gitdir; do
+    [[ -z "$gitdir" ]] && continue
+    sha=$(git --git-dir="$gitdir" rev-parse HEAD 2>/dev/null) || continue
+    [[ -n "$sha" ]] && echo "$sha" >> "$SEEN_FILE"
+  done <<< "$WATCH"
+}
+
+# Which of the watched repositories this session has not met before. Computed
+# before the set is written back, since writing makes them all old.
+NEW_REPOS=$'\n'
+collect_new_repos() {
+  local gitdir
+  while IFS= read -r gitdir; do
+    [[ -z "$gitdir" ]] && continue
+    grep -qxF "$gitdir" "$WATCHED_FILE" 2>/dev/null && continue
+    case "$NEW_REPOS" in
+      *$'\n'"$gitdir"$'\n'*) ;;
+      *) NEW_REPOS+="$gitdir"$'\n'; echo "$gitdir" >> "$WATCHED_FILE" ;;
+    esac
+  done <<< "$WATCH"
+}
+
+if [[ ! -f "$BASE_FILE" ]]; then
+  date +%s > "$BASE_FILE"
+  record_heads
+  collect_new_repos
+  exit 0
+fi
+
+# SessionStart has no tool to follow, so once the baseline exists there is
+# nothing more for it to do.
+[[ "$EVENT" == SessionStart ]] && exit 0
+
+# ---------------------------------------------------------------------------
+# PreToolUse: baseline what the command is about to touch.
+#
+# `SessionStart` covers the repositories that existed on the watch list when
+# the session opened, which is the session's own and nothing else. A hint adds
+# repositories as the session goes, and a repository added that way has never
+# been baselined: whatever sits at its HEAD arrives unaccounted for without
+# having moved at all, and no amount of looking at it afterwards can separate
+# "this call committed here" from "this is where it already was".
+#
+# Running the same hints before the command settles that, because at this point
+# the command has not run: HEAD is where the command found it. Recording it
+# here is what makes the PostToolUse question — did HEAD move? — answerable for
+# a repository the session is meeting for the first time.
+#
+# Only the newly met ones are recorded. A repository already being watched
+# keeps whatever the session knows about it, so a commit made between two tool
+# calls — in a GUI client, or by another agent — is still a HEAD that moved
+# while we were watching, and still reported.
+#
+# Nothing is written to stdout on this path. A PreToolUse hook's output is how
+# a host is told to block a tool call, and this hook has no opinion about that.
+# ---------------------------------------------------------------------------
+
+record_new_heads() {
+  local gitdir sha
+  while IFS= read -r gitdir; do
+    [[ -z "$gitdir" ]] && continue
+    sha=$(git --git-dir="$gitdir" rev-parse HEAD 2>/dev/null) || continue
+    [[ -n "$sha" ]] && echo "$sha" >> "$SEEN_FILE"
+  done <<< "$NEW_REPOS"
+}
+
+if [[ "$EVENT" == PreToolUse ]]; then
+  collect_new_repos
+  record_new_heads
+  exit 0
+fi
+
+collect_new_repos
+
+BASE_TS=$(cat "$BASE_FILE" 2>/dev/null || echo "")
+[[ "$BASE_TS" =~ ^[0-9]+$ ]] || BASE_TS=0
+
+# ---------------------------------------------------------------------------
+# Look for a HEAD that moved.
+#
+# Everything here is best-effort. A non-colocated Jujutsu repo has no .git to
+# answer these queries and a bare or out-of-tree layout may not resolve; those
+# simply contribute nothing rather than failing the hook.
+# ---------------------------------------------------------------------------
+
+SHA=""
+GITDIR=""
+while IFS= read -r gitdir; do
+  [[ -z "$gitdir" ]] && continue
+  candidate=$(git --git-dir="$gitdir" rev-parse HEAD 2>/dev/null) || continue
+  [[ -z "$candidate" ]] && continue
+  # Already accounted for: either a baseline HEAD, or one we have nudged about.
+  if [[ -f "$SEEN_FILE" ]] && grep -qxF "$candidate" "$SEEN_FILE" 2>/dev/null; then
+    continue
+  fi
+  # A repository still being met for the first time *here* is one PreToolUse
+  # did not baseline — the host does not run that event, or the hook was added
+  # to a session already in progress. Nothing about its HEAD is evidence of
+  # anything: it has not been observed to move, only found somewhere, and a
+  # commit made in it minutes ago by another agent looks exactly like one made
+  # by the call that just ran. It is recorded and passed over.
+  #
+  # What that costs, where PreToolUse is missing, is a commit in a repository
+  # the session had never touched until the call that committed in it. The
+  # call after that one is detected normally. A missed nudge is the safe
+  # direction; announcing a commit the user did not make is the bug this hook
+  # exists to avoid.
+  case "$NEW_REPOS" in
+    *$'\n'"$gitdir"$'\n'*)
+      echo "$candidate" >> "$SEEN_FILE"
+      continue
+      ;;
+  esac
+  # New to us, but is it new at all? `git checkout other-branch` and
+  # `git reset --hard HEAD~1` both move HEAD onto a commit that already
+  # existed, and neither is something to congratulate the user for.
+  #
+  # HEAD's reflog says what moved it, and says so whatever the dates involved.
+  # Only `checkout:` and `reset:` are dismissed on that basis: a merge, a
+  # rebase, a cherry-pick, a revert and an amend all write real commits and
+  # carry their own reasons. Where the reflog is off or absent this is empty
+  # and the committer date decides alone, as it did before.
+  reason=$(git --git-dir="$gitdir" reflog show -1 --format=%gs HEAD 2>/dev/null) || reason=""
+  case "$reason" in
+    checkout:*|reset:*) continue ;;
+    # A fast-forward writes no commit — it moves HEAD onto commits that were
+    # already fetched, usually somebody else's. Matched on the `Fast-forward`
+    # ending rather than on `merge`/`pull` openers, because the opener carries
+    # whatever flags were typed: `pull -q --ff-only: Fast-forward`.
+    *": Fast-forward") continue ;;
+    # Filling an unborn HEAD from a remote is transport, not authorship, and
+    # git names it differently again. Surveyed rather than guessed: of the four
+    # ways an empty repository gets its first commit from elsewhere, `git
+    # fetch && git checkout` and `git fetch && git reset` say `checkout:` and
+    # `reset:` and are already covered; `git pull` into an empty repository
+    # says `initial pull`, with no colon and no `Fast-forward`; and a `git
+    # clone` run as a session's first command says `clone: from <url>`. A real
+    # first commit is `commit (initial): <subject>` and is untouched by these.
+    "initial pull"|clone:*) continue ;;
+    # A rebase that picked nothing is a fast-forward wearing a different hat.
+    # A real one leaves a `rebase (pick)` — or (continue), (squash), (fixup),
+    # (reword) — between start and finish; a fast-forward has start directly
+    # below finish.
+    "rebase (finish)"*)
+      prev=$(git --git-dir="$gitdir" reflog show -2 --format=%gs HEAD 2>/dev/null | tail -1)
+      case "$prev" in "rebase (start)"*) continue ;; esac
+      ;;
+  esac
+  # And the committer date, for repositories with no reflog to consult. `%ct`
+  # rather than the author date, which `--amend` and `rebase` preserve.
+  #
+  # This is the user's own clock and the user can set it: a commit written with
+  # GIT_COMMITTER_DATE backdated before the session began is not recognized as
+  # one. That is deliberate. There is no unspoofable timestamp here — reflog
+  # entries take their date from the same committer ident — and the failure is
+  # a missed nudge on a commit whose date says it predates the session, which
+  # is the safer direction to fail in.
+  ts=$(git --git-dir="$gitdir" log -1 --format=%ct 2>/dev/null) || ts=""
+  [[ "$ts" =~ ^[0-9]+$ ]] || continue
+  (( ts < BASE_TS )) && continue
+  SHA="$candidate"
+  GITDIR="$gitdir"
+  break
+done <<< "$WATCH"
+
+[[ -z "$SHA" ]] && exit 0
+
+# ---------------------------------------------------------------------------
+# Rate limiting and de-duplication.
+#
+# The state is read, tested, and then written, so concurrent hooks in one
+# session would otherwise interleave: two could clear the de-dupe check for the
+# same SHA before either records it, and two could read the same offer count
+# and each write count+1, losing an increment and overrunning the cap. Tool
+# calls do run in parallel, so this is reachable — committing in two
 # repositories at once is enough.
 #
-# mkdir is the lock because it is atomic on POSIX and needs nothing that
-# isn't already assumed here. flock would be the conventional choice but is
+# mkdir is the lock because it is atomic on POSIX and needs nothing that isn't
+# already assumed here. flock would be the conventional choice but is
 # util-linux, absent on stock macOS, and this hook ships to both.
 #
-# Losing the race means staying silent rather than waiting. Contention here
-# means another commit in the same session is being handled right now, so at
-# worst one nudge is skipped in a situation already near the session cap —
-# cheaper than making every commit wait on a lock.
+# Losing the race means staying silent rather than waiting. Contention means
+# another commit in the same session is being handled right now, so at worst
+# one nudge is skipped in a situation already near the session cap — cheaper
+# than making every commit wait on a lock.
+# ---------------------------------------------------------------------------
+
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  # Reclaim a lock orphaned by a process that died before releasing it,
-  # then take one more shot.
+  # Reclaim a lock orphaned by a process that died before releasing it, then
+  # take one more shot.
   if [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
     rmdir "$LOCK_DIR" 2>/dev/null
   fi
@@ -545,7 +442,9 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
-if [[ -n "$SHA" && -f "$SEEN_FILE" ]] && grep -qxF "$SHA" "$SEEN_FILE" 2>/dev/null; then
+# Re-check under the lock: another hook may have claimed this SHA between the
+# scan above and here.
+if [[ -f "$SEEN_FILE" ]] && grep -qxF "$SHA" "$SEEN_FILE" 2>/dev/null; then
   exit 0
 fi
 
@@ -556,8 +455,10 @@ fi
 # A corrupt or truncated state file must not wedge the hook open.
 [[ "$offers" =~ ^[0-9]+$ ]] || offers=0
 
-# Stop after 2 offers per session.
+# Stop after 2 offers per session. The SHA is still recorded, so a commit that
+# arrives over the cap is not re-examined on every subsequent tool call.
 if [[ "$offers" -ge 2 ]]; then
+  echo "$SHA" >> "$SEEN_FILE"
   exit 0
 fi
 
@@ -568,22 +469,22 @@ fi
 # removed, length capped.
 # ---------------------------------------------------------------------------
 
-CONTEXT=""
-if [[ -n "$SHA" ]]; then
-  SUBJECT=$(git "${GIT_LOC[@]}" log -1 --pretty=%s 2>/dev/null \
-    | tr '[:cntrl:]' ' ' | tr -d '"\\' | cut -c1-120 \
-    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-  if [[ -n "$SUBJECT" ]]; then
-    CONTEXT=" (${SHA}: ${SUBJECT})"
-  else
-    CONTEXT=" (${SHA})"
-  fi
+SHORT=$(git --git-dir="$GITDIR" rev-parse --short "$SHA" 2>/dev/null) || SHORT=""
+[[ -z "$SHORT" ]] && SHORT="${SHA:0:7}"
+
+SUBJECT=$(git --git-dir="$GITDIR" log -1 --pretty=%s "$SHA" 2>/dev/null \
+  | tr '[:cntrl:]' ' ' | tr -d '"\\' | cut -c1-120 \
+  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+if [[ -n "$SUBJECT" ]]; then
+  CONTEXT=" (${SHORT}: ${SUBJECT})"
+else
+  CONTEXT=" (${SHORT})"
 fi
 
 # Record the emission, then emit. Both writes happen only on the path that
 # actually produces a nudge, so a call that exits early above never consumes
 # part of the session budget.
-[[ -n "$SHA" ]] && echo "$SHA" >> "$SEEN_FILE"
+echo "$SHA" >> "$SEEN_FILE"
 echo $(( offers + 1 )) > "$STATE_FILE"
 
 # ---------------------------------------------------------------------------
