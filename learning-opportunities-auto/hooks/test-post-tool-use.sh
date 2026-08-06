@@ -55,6 +55,15 @@ commit_in() {
   git -C "$1" commit -q -m "$2"
 }
 
+# commit_in_at <repo> <subject> <epoch> — a commit that happened at a stated
+# time. The committer date carries the reflog entry's date with it, so this
+# moves both, which is what a commit made a while ago actually looks like.
+commit_in_at() {
+  echo "$RANDOM$RANDOM" > "$1/file.txt"
+  git -C "$1" add file.txt
+  GIT_COMMITTER_DATE="@$3 +0000" git -C "$1" commit -q --date="@$3 +0000" -m "$2"
+}
+
 HOOK_OUT=""
 HOOK_STATUS=0
 # run_hook <session> <cwd> <command> [tool output]
@@ -429,6 +438,39 @@ check nudge "a repo named twice is watched once" \
 check silent "the second spelling must not produce a second nudge" \
   s-samerepo "$REPO" "ls"
 
+# Membership in the watch set is bounded on both sides. Entries are stored
+# with a newline either side, so `/repo/.git` cannot read as already present
+# in a set holding only `/other/repo/.git` — unbounded, the second repository
+# was dropped and its commit went unreported. It takes one git directory being
+# a literal path suffix of another, which is ordinary enough in life
+# (`/repos/app` alongside `/home/u/repos/app`) and is built here by nesting the
+# temporary directory inside itself. The longer path is named first, so the
+# shorter one is the one at risk of being swallowed.
+# Nested with the *resolved* temporary directory, since that is what the hook
+# stores: on macOS `$TMPDIR` is under `/var`, a symlink to `/private/var`, and
+# nesting the unresolved spelling produces two paths where neither contains
+# the other and the case proves nothing.
+sfx_real=$(cd "$TEST_TMPDIR" && pwd -P)
+sfx_short="$TEST_TMPDIR/sfx/repo"
+sfx_long="$TEST_TMPDIR/outer$sfx_real/sfx/repo"
+mkdir -p "$(dirname "$sfx_long")"
+new_repo "$sfx_short"
+new_repo "$sfx_long"
+baseline s-suffix "$REPO"
+# The longer repository is put beyond suspicion first — an old session and an
+# older history — so the nudge under test can only have come from the shorter
+# one. Left fresh, its own seed commit is a commit nobody accounted for and it
+# answers the assertion by itself, whether or not the shorter repository was
+# ever watched.
+now=$(date +%s)
+echo $(( now - 3600 )) > "$TEST_TMPDIR/lo_auto_s-suffix.base"
+commit_in_at "$sfx_long" "the longer repo, long since" $(( now - 7200 ))
+commit_in "$sfx_short" "commit in the repo whose path is a suffix"
+check nudge "a git dir that is a path suffix of one already watched is still watched" \
+  s-suffix "$REPO" "git -C $sfx_long log && git -C $sfx_short commit -m \"x\""
+ok "$(grep -q 'commit in the repo whose path is a suffix' <<<"$HOOK_OUT"; echo $?)" \
+   "suffix path: the nudge must name the shorter repo's commit"
+
 # The hint is deliberately structure-blind — it does not know what a heredoc
 # body or a comment is, and does not need to. Over-collecting is free.
 other3="$TEST_TMPDIR/other3"
@@ -438,6 +480,54 @@ commit_in "$other3" "commit hinted from inside a heredoc"
 check nudge "a path mentioned only inside a heredoc body still gets watched" s-hint "$REPO" "cat <<EOF > notes.txt
 remember to cd $other3 later
 EOF"
+
+# --- repositories met for the first time ------------------------------------
+# A hint adds a repository to the watch list whatever the command was doing
+# with it, so a repository can arrive mid-session having never been baselined.
+# Its HEAD is then unaccounted for without having moved: only the fact that it
+# moved *now* distinguishes a commit from a repository merely being looked at.
+#
+# The repository is committed to before the session opens, then again while the
+# session is running but by something else — the shape of a second agent, or a
+# terminal alongside — and only then is it named, by a read-only command.
+late="$TEST_TMPDIR/late"
+new_repo "$late"
+baseline s-late "$REPO"
+# The session has been open an hour — long enough for the other repository's
+# commit to land inside it. Ten minutes ago is the point: comfortably after
+# the session baseline, so the committer date alone says nothing, and just as
+# comfortably outside the tool call that has only now named the repository.
+now=$(date +%s)
+echo $(( now - 3600 )) > "$TEST_TMPDIR/lo_auto_s-late.base"
+commit_in_at "$late" "somebody else's commit, mid-session" $(( now - 600 ))
+check silent "a repo first seen by a read-only command must not nudge" \
+  s-late "$REPO" "git -C $late status"
+# And not on the call after, either: having been baselined on sight, its HEAD
+# is accounted for and does not become eligible again.
+check silent "a repo baselined on sight stays accounted for" \
+  s-late "$REPO" "git -C $late log --oneline"
+
+# The other half of the same rule: discovery and commit in one call is the
+# ordinary `git -C ../other commit`, and still nudges.
+late2="$TEST_TMPDIR/late2"
+new_repo "$late2"
+baseline s-late2 "$REPO"
+commit_in "$late2" "a commit in a repo seen for the first time"
+check nudge "a repo first seen by the call that committed in it still nudges" \
+  s-late2 "$REPO" "git -C $late2 commit -m \"x\""
+ok "$(grep -q 'a commit in a repo seen for the first time' <<<"$HOOK_OUT"; echo $?)" \
+   "first-seen repo: nudge should name that repo's commit"
+
+# A repository whose HEAD sits on a commit dated in the future would otherwise
+# stay eligible for as long as its clock says, so the window is bounded on both
+# sides rather than only below.
+ahead="$TEST_TMPDIR/ahead"
+new_repo "$ahead"
+GIT_COMMITTER_DATE="@$(( $(date +%s) + 86400 )) +0000" \
+  git -C "$ahead" commit -q --amend --no-edit --date="@$(( $(date +%s) + 86400 )) +0000"
+baseline s-ahead "$REPO"
+check silent "a first-seen repo dated in the future must not nudge" \
+  s-ahead "$REPO" "git -C $ahead status"
 
 # Colocated Jujutsu writes real git commits to a real .git, so it is observed
 # like any other repo. A *non-colocated* jj repo has no .git and is not

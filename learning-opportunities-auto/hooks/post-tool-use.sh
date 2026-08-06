@@ -36,6 +36,12 @@ set -uo pipefail
 # onto somebody else's work — all of which move HEAD to a commit that already
 # existed.
 #
+# Condition 1 assumes the repository was baselined, and a repository named by a
+# hint for the first time was not: a read-only `git -C ../other status` puts it
+# on the list, and its HEAD arrives unaccounted for without having moved at all.
+# Such a repository is baselined on sight, and nudged about only if its HEAD
+# moved within a couple of minutes of the tool call that just ran.
+#
 # The reflog is consulted only to dismiss, and only for the reasons git writes
 # when no commit was created: `checkout:`, `reset:`, anything ending in
 # `Fast-forward`, and a `rebase (finish)` with nothing picked below it. A
@@ -99,15 +105,18 @@ EVENT=$(echo "$INPUT" | grep -o '"hook_event_name":"[^"]*"' | head -1 | sed 's/"
 # Session state, all keyed on session ID in $TMPDIR and reset when the session
 # ends:
 #
-#   .base   epoch second the session was first seen; a commit older than this
-#           predates the session and is not ours to nudge about
-#   .seen   commit SHAs already accounted for, including the baseline HEADs
-#   .state  count of nudges emitted this session, capped at 2
+#   .base    epoch second the session was first seen; a commit older than this
+#            predates the session and is not ours to nudge about
+#   .seen    commit SHAs already accounted for, including the baseline HEADs
+#   .watched git directories already under observation; one not listed here is
+#            being seen for the first time and has never been baselined
+#   .state   count of nudges emitted this session, capped at 2
 # ---------------------------------------------------------------------------
 
 SAFE_ID="${SESSION_ID//[^a-zA-Z0-9_-]/_}"
 BASE_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.base"
 SEEN_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.seen"
+WATCHED_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.watched"
 STATE_FILE="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.state"
 LOCK_DIR="${TMPDIR:-/tmp}/lo_auto_${SAFE_ID}.lock"
 
@@ -144,7 +153,13 @@ repo_gitdir() {
     || git --git-dir="$1" rev-parse --absolute-git-dir 2>/dev/null
 }
 
-WATCH=""
+# Newline-delimited, and newline-*prefixed* so that every entry is bounded on
+# both sides. Without the leading newline the first entry has no left boundary
+# and `/repo/.git` reads as already present in a set holding only
+# `/other/repo/.git`, which would drop the second repository from the watch.
+# The readers below skip empty lines, so the extra leading newline costs
+# nothing.
+WATCH=$'\n'
 add_watch() {
   local gitdir
   # `-e` rather than `-d`: a repository with a separate git directory has a
@@ -153,7 +168,7 @@ add_watch() {
   gitdir=$(repo_gitdir "$1") || return 0
   [[ -z "$gitdir" ]] && return 0
   case "$WATCH" in
-    *"$gitdir"$'\n'*) ;;
+    *$'\n'"$gitdir"$'\n'*) ;;
     *) WATCH+="$gitdir"$'\n' ;;
   esac
 }
@@ -234,9 +249,25 @@ record_heads() {
   done <<< "$WATCH"
 }
 
+# Which of the watched repositories this session has not met before. Computed
+# before the set is written back, since writing makes them all old.
+NEW_REPOS=$'\n'
+collect_new_repos() {
+  local gitdir
+  while IFS= read -r gitdir; do
+    [[ -z "$gitdir" ]] && continue
+    grep -qxF "$gitdir" "$WATCHED_FILE" 2>/dev/null && continue
+    case "$NEW_REPOS" in
+      *$'\n'"$gitdir"$'\n'*) ;;
+      *) NEW_REPOS+="$gitdir"$'\n'; echo "$gitdir" >> "$WATCHED_FILE" ;;
+    esac
+  done <<< "$WATCH"
+}
+
 if [[ ! -f "$BASE_FILE" ]]; then
   date +%s > "$BASE_FILE"
   record_heads
+  collect_new_repos
   exit 0
 fi
 
@@ -244,8 +275,27 @@ fi
 # nothing more for it to do.
 [[ "$EVENT" == SessionStart ]] && exit 0
 
+collect_new_repos
+
 BASE_TS=$(cat "$BASE_FILE" 2>/dev/null || echo "")
 [[ "$BASE_TS" =~ ^[0-9]+$ ]] || BASE_TS=0
+NOW=$(date +%s)
+
+# How recently a first-seen repository's HEAD must have moved for that movement
+# to be attributable to the tool call that just ran. See the scan below.
+NEW_REPO_WINDOW=120
+
+# When HEAD last moved, per its own reflog entry — which is when the move was
+# recorded here, not when the commit at the far end was written. They differ
+# for anything fetched, cherry-picked or rebased in from elsewhere. Falls back
+# to the committer date where the reflog is off or absent.
+head_moved_at() {
+  local raw ts
+  raw=$(git --git-dir="$1" reflog show -1 --date=raw --format=%gd HEAD 2>/dev/null)
+  ts=$(printf '%s' "$raw" | sed -n 's/.*{\([0-9][0-9]*\).*/\1/p')
+  [[ "$ts" =~ ^[0-9]+$ ]] || ts=$(git --git-dir="$1" log -1 --format=%ct 2>/dev/null)
+  printf '%s' "$ts"
+}
 
 # ---------------------------------------------------------------------------
 # Look for a HEAD that moved.
@@ -265,6 +315,45 @@ while IFS= read -r gitdir; do
   if [[ -f "$SEEN_FILE" ]] && grep -qxF "$candidate" "$SEEN_FILE" 2>/dev/null; then
     continue
   fi
+  # A repository the session is meeting for the first time was never
+  # baselined, so "not in the seen set" says nothing about it: a read-only
+  # `git -C ../other status` is enough to put a repository on the watch list,
+  # and whatever sits at its HEAD arrives unaccounted for. Where a watched
+  # repository's HEAD is known to have moved because we were looking, here it
+  # merely *is* somewhere, and the session-wide date window is far too loose to
+  # tell the difference — anything committed in that repository since the
+  # session opened, by another agent or another terminal, would read as ours.
+  #
+  # So the discovery is baselined either way, and only a HEAD that moved within
+  # the window of the tool call that just ran is also nudged about. That
+  # narrows the window from the whole session to seconds without going back to
+  # reading the command: `git -C ../other commit` is observed exactly as
+  # before, while `git -C ../other status` reports what was already there and
+  # is recorded rather than announced.
+  #
+  # The cost is a commit made early in a long-running script that touches a
+  # repository for the first time — `./release.sh` committing next door and
+  # then building for five minutes. That misses. A missed nudge is the safe
+  # direction; a false one is the bug this hook exists to avoid.
+# The discovery is recorded in the seen set only where it is being dismissed,
+# never on the way to a nudge: the de-duplication below re-reads that file
+# under the lock and would take our own write as another hook having claimed
+# the commit first. Dismissing without recording would leave the repository
+# unaccounted for and eligible again on the next call, when it is no longer
+# new and the loose session-wide window applies.
+  case "$NEW_REPOS" in
+    *$'\n'"$gitdir"$'\n'*)
+      moved=$(head_moved_at "$gitdir")
+      # Bounded on both sides: a future-dated HEAD would otherwise stay
+      # eligible for as long as its date says, which is the same trap the
+      # committer-date guard below fell into.
+      if ! [[ "$moved" =~ ^[0-9]+$ ]] \
+         || (( moved < NOW - NEW_REPO_WINDOW || moved > NOW + NEW_REPO_WINDOW )); then
+        echo "$candidate" >> "$SEEN_FILE"
+        continue
+      fi
+      ;;
+  esac
   # New to us, but is it new at all? `git checkout other-branch` and
   # `git reset --hard HEAD~1` both move HEAD onto a commit that already
   # existed, and neither is something to congratulate the user for.
