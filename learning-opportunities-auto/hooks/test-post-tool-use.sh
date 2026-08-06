@@ -64,6 +64,27 @@ commit_in_at() {
   GIT_COMMITTER_DATE="@$3 +0000" git -C "$1" commit -q --date="@$3 +0000" -m "$2"
 }
 
+# pre <session> <cwd> <command> — the PreToolUse half of a tool call.
+#
+# Real sessions run one before every Bash call, and what it records depends on
+# running *before* the command: it baselines the repositories the command names
+# at the point HEAD is still where the command found it. So the tests place it
+# explicitly, ahead of the commit that stands in for the command running, and a
+# case that omits it is asserting about a host that does not run the event.
+#
+# It must stay silent whatever it finds. A PreToolUse hook's output is how a
+# host is told to block a tool call.
+pre() {
+  local payload out
+  payload=$(printf '{"session_id":"%s","cwd":"%s","hook_event_name":"PreToolUse","tool_input":{"command":"%s"}}' \
+    "$1" "$(json_escape "$2")" "$(json_escape "$3")")
+  out=$(printf '%s' "$payload" | TMPDIR="$TEST_TMPDIR" bash "$HOOK" 2>/dev/null)
+  if [[ -n "$out" ]]; then
+    fail=$((fail + 1))
+    printf 'FAIL  PreToolUse wrote to stdout for %s: %s\n' "$1" "$out" >&2
+  fi
+}
+
 HOOK_OUT=""
 HOOK_STATUS=0
 # run_hook <session> <cwd> <command> [tool output]
@@ -345,6 +366,7 @@ git commit -m "x"'
 other="$TEST_TMPDIR/other"
 new_repo "$other"
 baseline s-dashc "$REPO"
+pre s-dashc "$REPO" "git -C $other commit -m \"x\""
 commit_in "$other" "commit in the other repo"
 check nudge "commit in a repo named by -C" s-dashc "$REPO" "git -C $other commit -m \"x\""
 ok "$(grep -q 'commit in the other repo' <<<"$HOOK_OUT"; echo $?)" \
@@ -353,6 +375,7 @@ ok "$(grep -q 'commit in the other repo' <<<"$HOOK_OUT"; echo $?)" \
 other2="$TEST_TMPDIR/other2"
 new_repo "$other2"
 baseline s-cd "$REPO"
+pre s-cd "$REPO" "cd $other2 && git commit -m \"x\""
 commit_in "$other2" "commit after a cd"
 check nudge "commit in a repo reached by cd" s-cd "$REPO" "cd $other2 && git commit -m \"x\""
 
@@ -364,6 +387,7 @@ nest="$TEST_TMPDIR/nest"
 new_repo "$nest"
 new_repo "$nest/parent/child"
 baseline s-chain "$nest"
+pre s-chain "$nest" 'cd parent && cd child && git commit -m "x"'
 commit_in "$nest/parent/child" "commit two cds down"
 check nudge "commit in a repo reached by chained relative cd" \
   s-chain "$nest" 'cd parent && cd child && git commit -m "x"'
@@ -377,6 +401,7 @@ up="$TEST_TMPDIR/up"
 new_repo "$up"
 new_repo "$up/deep/sibling"
 baseline s-updown "$up"
+pre s-updown "$up" 'cd deep/inner && cd .. && cd sibling && git commit -m "x"'
 commit_in "$up/deep/sibling" "commit after cd .."
 check nudge "commit in a repo reached by cd down then up then across" \
   s-updown "$up" 'cd deep/inner && cd .. && cd sibling && git commit -m "x"'
@@ -386,6 +411,7 @@ rel="$TEST_TMPDIR/relc"
 new_repo "$rel"
 new_repo "$rel/sub/target"
 baseline s-relc "$rel"
+pre s-relc "$rel" 'cd sub && git -C target commit -m "x"'
 commit_in "$rel/sub/target" "commit via a relative -C"
 check nudge "commit in a repo named by -C relative to an earlier cd" \
   s-relc "$rel" 'cd sub && git -C target commit -m "x"'
@@ -400,6 +426,7 @@ check nudge "commit in a repo named by -C relative to an earlier cd" \
 gd="$TEST_TMPDIR/gitdirhint"
 new_repo "$gd"
 baseline s-gitdir "$REPO"
+pre s-gitdir "$REPO" "git --git-dir=$gd/.git commit -m \"x\""
 commit_in "$gd" "commit named only by --git-dir"
 check nudge "commit in a repo named by --git-dir alone" \
   s-gitdir "$REPO" "git --git-dir=$gd/.git commit -m \"x\""
@@ -420,11 +447,13 @@ git -C "$sepwt" add file.txt
 git -C "$sepwt" commit -q -m "seed commit"
 
 baseline s-sepgd "$REPO"
+pre s-sepgd "$REPO" "git --git-dir=$sepgd commit -m \"x\""
 commit_in "$sepwt" "commit in a separate git directory"
 check nudge "commit in a --separate-git-dir repo named by its git directory" \
   s-sepgd "$REPO" "git --git-dir=$sepgd commit -m \"x\""
 
 baseline s-sepfile "$REPO"
+pre s-sepfile "$REPO" "git --git-dir=$sepwt/.git commit -m \"x\""
 commit_in "$sepwt" "commit reached through the .git file"
 check nudge "commit in a --separate-git-dir repo named by its .git file" \
   s-sepfile "$REPO" "git --git-dir=$sepwt/.git commit -m \"x\""
@@ -432,6 +461,7 @@ check nudge "commit in a --separate-git-dir repo named by its .git file" \
 # The two spellings of one repository are the same repository, and collapse to
 # a single watch entry rather than producing a nudge each.
 baseline s-samerepo "$REPO"
+pre s-samerepo "$REPO" "git -C $gd log && git --git-dir=$gd/.git commit -m \"x\""
 commit_in "$gd" "one commit, two spellings"
 check nudge "a repo named twice is watched once" \
   s-samerepo "$REPO" "git -C $gd log && git --git-dir=$gd/.git commit -m \"x\""
@@ -465,6 +495,7 @@ baseline s-suffix "$REPO"
 now=$(date +%s)
 echo $(( now - 3600 )) > "$TEST_TMPDIR/lo_auto_s-suffix.base"
 commit_in_at "$sfx_long" "the longer repo, long since" $(( now - 7200 ))
+pre s-suffix "$REPO" "git -C $sfx_long log && git -C $sfx_short commit -m \"x\""
 commit_in "$sfx_short" "commit in the repo whose path is a suffix"
 check nudge "a git dir that is a path suffix of one already watched is still watched" \
   s-suffix "$REPO" "git -C $sfx_long log && git -C $sfx_short commit -m \"x\""
@@ -476,6 +507,9 @@ ok "$(grep -q 'commit in the repo whose path is a suffix' <<<"$HOOK_OUT"; echo $
 other3="$TEST_TMPDIR/other3"
 new_repo "$other3"
 baseline s-hint "$REPO"
+pre s-hint "$REPO" "cat <<EOF > notes.txt
+remember to cd $other3 later
+EOF"
 commit_in "$other3" "commit hinted from inside a heredoc"
 check nudge "a path mentioned only inside a heredoc body still gets watched" s-hint "$REPO" "cat <<EOF > notes.txt
 remember to cd $other3 later
@@ -484,48 +518,70 @@ EOF"
 # --- repositories met for the first time ------------------------------------
 # A hint adds a repository to the watch list whatever the command was doing
 # with it, so a repository can arrive mid-session having never been baselined.
-# Its HEAD is then unaccounted for without having moved: only the fact that it
-# moved *now* distinguishes a commit from a repository merely being looked at.
+# Its HEAD is then unaccounted for without having moved at all, and nothing
+# observed afterwards separates "this call committed here" from "this is where
+# it already was". The PreToolUse pass settles it by recording HEAD while the
+# command that named the repository has not yet run.
 #
-# The repository is committed to before the session opens, then again while the
-# session is running but by something else — the shape of a second agent, or a
-# terminal alongside — and only then is it named, by a read-only command.
+# Here the repository is committed to while the session is running but by
+# something else — the shape of a second agent, or a terminal alongside — and
+# only then named, by a read-only command. The session is an hour old and the
+# commit ten minutes into it, so it sits comfortably after the baseline and the
+# committer date has nothing to say about it either way.
 late="$TEST_TMPDIR/late"
 new_repo "$late"
 baseline s-late "$REPO"
-# The session has been open an hour — long enough for the other repository's
-# commit to land inside it. Ten minutes ago is the point: comfortably after
-# the session baseline, so the committer date alone says nothing, and just as
-# comfortably outside the tool call that has only now named the repository.
 now=$(date +%s)
 echo $(( now - 3600 )) > "$TEST_TMPDIR/lo_auto_s-late.base"
 commit_in_at "$late" "somebody else's commit, mid-session" $(( now - 600 ))
+pre s-late "$REPO" "git -C $late status"
 check silent "a repo first seen by a read-only command must not nudge" \
   s-late "$REPO" "git -C $late status"
-# And not on the call after, either: having been baselined on sight, its HEAD
-# is accounted for and does not become eligible again.
-check silent "a repo baselined on sight stays accounted for" \
+# And not on the call after, either: having been recorded on first sight, its
+# HEAD is accounted for and does not become eligible again.
+pre s-late "$REPO" "git -C $late log --oneline"
+check silent "a repo recorded on sight stays accounted for" \
   s-late "$REPO" "git -C $late log --oneline"
 
-# The other half of the same rule: discovery and commit in one call is the
-# ordinary `git -C ../other commit`, and still nudges.
+# The other half of the same rule. Same first sighting, but the commit lands
+# between the two halves of the tool call — which is what `git -C ../other
+# commit` is — and the movement is observed.
 late2="$TEST_TMPDIR/late2"
 new_repo "$late2"
 baseline s-late2 "$REPO"
+pre s-late2 "$REPO" "git -C $late2 commit -m \"x\""
 commit_in "$late2" "a commit in a repo seen for the first time"
 check nudge "a repo first seen by the call that committed in it still nudges" \
   s-late2 "$REPO" "git -C $late2 commit -m \"x\""
 ok "$(grep -q 'a commit in a repo seen for the first time' <<<"$HOOK_OUT"; echo $?)" \
    "first-seen repo: nudge should name that repo's commit"
 
-# A repository whose HEAD sits on a commit dated in the future would otherwise
-# stay eligible for as long as its clock says, so the window is bounded on both
-# sides rather than only below.
+# Without a PreToolUse pass — a host that does not run the event, or a hook
+# added to a session already under way — a repository still unmet at
+# PostToolUse was baselined by neither event, and its HEAD has not been
+# observed to move. It is recorded rather than reported. This is the cost of
+# the rule above, and it is deliberate: the alternative is announcing a commit
+# on the strength of a date, which is what this whole approach exists to stop.
+late3="$TEST_TMPDIR/late3"
+new_repo "$late3"
+baseline s-late3 "$REPO"
+commit_in "$late3" "a commit with no PreToolUse pass"
+check silent "with no PreToolUse pass, a first-seen repo's commit is recorded, not reported" \
+  s-late3 "$REPO" "git -C $late3 commit -m \"x\""
+# The repository is watched from then on, so the degradation lasts exactly one
+# call rather than for the session.
+commit_in "$late3" "the next commit in the same repo"
+check nudge "a repo left unmet is watched from the next call on" \
+  s-late3 "$REPO" "git -C $late3 commit -m \"x\""
+
+# Whatever its dates say. A HEAD stamped in the future used to stay eligible
+# for as long as its clock claimed; being unmet is now the whole of the answer.
 ahead="$TEST_TMPDIR/ahead"
 new_repo "$ahead"
 GIT_COMMITTER_DATE="@$(( $(date +%s) + 86400 )) +0000" \
   git -C "$ahead" commit -q --amend --no-edit --date="@$(( $(date +%s) + 86400 )) +0000"
 baseline s-ahead "$REPO"
+pre s-ahead "$REPO" "git -C $ahead status"
 check silent "a first-seen repo dated in the future must not nudge" \
   s-ahead "$REPO" "git -C $ahead status"
 
@@ -669,10 +725,19 @@ if command -v jq >/dev/null 2>&1; then
   # Without it a commit made by the very first tool call cannot be attributed.
   ok "$(jq -e '.hooks.SessionStart[0].hooks[0].command' >/dev/null 2>&1 < "$CC_HOOKS"; echo $?)" \
      "hooks.json must register a SessionStart hook for the baseline"
+  # PreToolUse is what baselines a repository the session meets mid-run, while
+  # the command that named it has not yet moved anything. Without it, such a
+  # repository reaches PostToolUse unmet and its commit goes unreported.
+  ok "$(jq -e '.hooks.PreToolUse[0].hooks[0].command' >/dev/null 2>&1 < "$CC_HOOKS"; echo $?)" \
+     "hooks.json must register a PreToolUse hook for mid-session repositories"
+  ok "$(jq -e '.hooks.PreToolUse[0].matcher == "Bash"' >/dev/null 2>&1 < "$CC_HOOKS"; echo $?)" \
+     "PreToolUse must match Bash, the only tool that can move HEAD"
+
   cc_post=$(jq -r '.hooks.PostToolUse[0].hooks[0].command' "$CC_HOOKS")
   cc_start=$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$CC_HOOKS")
-  ok "$([[ "$cc_post" == "$cc_start" ]]; echo $?)" \
-     "SessionStart and PostToolUse must run the same script"
+  cc_pre=$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$CC_HOOKS")
+  ok "$([[ "$cc_post" == "$cc_start" && "$cc_post" == "$cc_pre" ]]; echo $?)" \
+     "SessionStart, PreToolUse and PostToolUse must run the same script"
 
   # ${CLAUDE_PLUGIN_ROOT} is expanded by Claude Code, but an unquoted expansion
   # word-splits: a plugin under a path with a space runs `bash /Users/John` and
@@ -693,7 +758,7 @@ if command -v jq >/dev/null 2>&1; then
   ok "$([[ $cc_unset_rc -eq 0 && -z "$cc_unset" ]]; echo $?)" \
      "Claude Code hook with CLAUDE_PLUGIN_ROOT unset: rc=$cc_unset_rc out='$cc_unset'"
 else
-  pass=$((pass + 5))
+  pass=$((pass + 7))
 fi
 
 # --- Codex hook path must not pin a plugin version -------------------------
@@ -726,6 +791,20 @@ if command -v jq >/dev/null 2>&1; then
   done
   codex_cmd=$(jq -r '.hooks.PostToolUse[0].hooks[0].command' "$CODEX_HOOKS")
 
+  # Codex runs PreToolUse for shell commands, so the mid-session baseline is
+  # available there too, and both entries have to resolve the same script the
+  # same way — a version-pinned or differently-resolved twin would run a script
+  # from another install, or none.
+  ok "$(jq -e '.hooks.PreToolUse[0].hooks[0].command' >/dev/null 2>&1 < "$CODEX_HOOKS"; echo $?)" \
+     "hooks.codex.json must register a PreToolUse hook"
+  codex_pre=$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$CODEX_HOOKS")
+  ok "$([[ "$codex_pre" == "$codex_cmd" ]]; echo $?)" \
+     "Codex PreToolUse and PostToolUse must run the same script"
+  codex_pre_matcher=$(jq -r '.hooks.PreToolUse[0].matcher' "$CODEX_HOOKS")
+  codex_post_matcher=$(jq -r '.hooks.PostToolUse[0].matcher' "$CODEX_HOOKS")
+  ok "$([[ "$codex_pre_matcher" == "$codex_post_matcher" ]]; echo $?)" \
+     "Codex PreToolUse and PostToolUse must match the same tools"
+
   # Highest version wins — not the newest on disk, and not the lexicographic
   # maximum: 1.0.2 is touched last here, and 1.9.0 sorts above 1.10.0 as text.
   touch "$fake_base/1.0.2"
@@ -746,7 +825,7 @@ if command -v jq >/dev/null 2>&1; then
   CODEX_HOME="$TEST_TMPDIR/nonexistent" bash -c "$codex_cmd" >/dev/null 2>&1
   ok "$?" "Codex hook with no cache should exit 0"
 else
-  pass=$((pass + 4))
+  pass=$((pass + 7))
 fi
 
 # --- the hook must still run under bash 3.2 --------------------------------

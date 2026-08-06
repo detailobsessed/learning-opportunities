@@ -36,11 +36,14 @@ set -uo pipefail
 # onto somebody else's work — all of which move HEAD to a commit that already
 # existed.
 #
-# Condition 1 assumes the repository was baselined, and a repository named by a
-# hint for the first time was not: a read-only `git -C ../other status` puts it
-# on the list, and its HEAD arrives unaccounted for without having moved at all.
-# Such a repository is baselined on sight, and nudged about only if its HEAD
-# moved within a couple of minutes of the tool call that just ran.
+# Condition 1 assumes the repository was baselined. `SessionStart` baselines the
+# session's own; a repository named by a hint arrives later and, unbaselined,
+# has a HEAD that is unaccounted for without having moved at all — a read-only
+# `git -C ../other status` is enough to put one on the list. So the same script
+# also runs on `PreToolUse`, where the command has not run yet and HEAD is
+# therefore where the command found it, and records the ones it is meeting for
+# the first time. A repository that reaches `PostToolUse` still unmet was not
+# baselined by either, and is recorded rather than reported.
 #
 # The reflog is consulted only to dismiss, and only for the reasons git writes
 # when no commit was created: `checkout:`, `reset:`, anything ending in
@@ -275,27 +278,49 @@ fi
 # nothing more for it to do.
 [[ "$EVENT" == SessionStart ]] && exit 0
 
+# ---------------------------------------------------------------------------
+# PreToolUse: baseline what the command is about to touch.
+#
+# `SessionStart` covers the repositories that existed on the watch list when
+# the session opened, which is the session's own and nothing else. A hint adds
+# repositories as the session goes, and a repository added that way has never
+# been baselined: whatever sits at its HEAD arrives unaccounted for without
+# having moved at all, and no amount of looking at it afterwards can separate
+# "this call committed here" from "this is where it already was".
+#
+# Running the same hints before the command settles that, because at this point
+# the command has not run: HEAD is where the command found it. Recording it
+# here is what makes the PostToolUse question — did HEAD move? — answerable for
+# a repository the session is meeting for the first time.
+#
+# Only the newly met ones are recorded. A repository already being watched
+# keeps whatever the session knows about it, so a commit made between two tool
+# calls — in a GUI client, or by another agent — is still a HEAD that moved
+# while we were watching, and still reported.
+#
+# Nothing is written to stdout on this path. A PreToolUse hook's output is how
+# a host is told to block a tool call, and this hook has no opinion about that.
+# ---------------------------------------------------------------------------
+
+record_new_heads() {
+  local gitdir sha
+  while IFS= read -r gitdir; do
+    [[ -z "$gitdir" ]] && continue
+    sha=$(git --git-dir="$gitdir" rev-parse HEAD 2>/dev/null) || continue
+    [[ -n "$sha" ]] && echo "$sha" >> "$SEEN_FILE"
+  done <<< "$NEW_REPOS"
+}
+
+if [[ "$EVENT" == PreToolUse ]]; then
+  collect_new_repos
+  record_new_heads
+  exit 0
+fi
+
 collect_new_repos
 
 BASE_TS=$(cat "$BASE_FILE" 2>/dev/null || echo "")
 [[ "$BASE_TS" =~ ^[0-9]+$ ]] || BASE_TS=0
-NOW=$(date +%s)
-
-# How recently a first-seen repository's HEAD must have moved for that movement
-# to be attributable to the tool call that just ran. See the scan below.
-NEW_REPO_WINDOW=120
-
-# When HEAD last moved, per its own reflog entry — which is when the move was
-# recorded here, not when the commit at the far end was written. They differ
-# for anything fetched, cherry-picked or rebased in from elsewhere. Falls back
-# to the committer date where the reflog is off or absent.
-head_moved_at() {
-  local raw ts
-  raw=$(git --git-dir="$1" reflog show -1 --date=raw --format=%gd HEAD 2>/dev/null)
-  ts=$(printf '%s' "$raw" | sed -n 's/.*{\([0-9][0-9]*\).*/\1/p')
-  [[ "$ts" =~ ^[0-9]+$ ]] || ts=$(git --git-dir="$1" log -1 --format=%ct 2>/dev/null)
-  printf '%s' "$ts"
-}
 
 # ---------------------------------------------------------------------------
 # Look for a HEAD that moved.
@@ -315,43 +340,22 @@ while IFS= read -r gitdir; do
   if [[ -f "$SEEN_FILE" ]] && grep -qxF "$candidate" "$SEEN_FILE" 2>/dev/null; then
     continue
   fi
-  # A repository the session is meeting for the first time was never
-  # baselined, so "not in the seen set" says nothing about it: a read-only
-  # `git -C ../other status` is enough to put a repository on the watch list,
-  # and whatever sits at its HEAD arrives unaccounted for. Where a watched
-  # repository's HEAD is known to have moved because we were looking, here it
-  # merely *is* somewhere, and the session-wide date window is far too loose to
-  # tell the difference — anything committed in that repository since the
-  # session opened, by another agent or another terminal, would read as ours.
+  # A repository still being met for the first time *here* is one PreToolUse
+  # did not baseline — the host does not run that event, or the hook was added
+  # to a session already in progress. Nothing about its HEAD is evidence of
+  # anything: it has not been observed to move, only found somewhere, and a
+  # commit made in it minutes ago by another agent looks exactly like one made
+  # by the call that just ran. It is recorded and passed over.
   #
-  # So the discovery is baselined either way, and only a HEAD that moved within
-  # the window of the tool call that just ran is also nudged about. That
-  # narrows the window from the whole session to seconds without going back to
-  # reading the command: `git -C ../other commit` is observed exactly as
-  # before, while `git -C ../other status` reports what was already there and
-  # is recorded rather than announced.
-  #
-  # The cost is a commit made early in a long-running script that touches a
-  # repository for the first time — `./release.sh` committing next door and
-  # then building for five minutes. That misses. A missed nudge is the safe
-  # direction; a false one is the bug this hook exists to avoid.
-# The discovery is recorded in the seen set only where it is being dismissed,
-# never on the way to a nudge: the de-duplication below re-reads that file
-# under the lock and would take our own write as another hook having claimed
-# the commit first. Dismissing without recording would leave the repository
-# unaccounted for and eligible again on the next call, when it is no longer
-# new and the loose session-wide window applies.
+  # What that costs, where PreToolUse is missing, is a commit in a repository
+  # the session had never touched until the call that committed in it. The
+  # call after that one is detected normally. A missed nudge is the safe
+  # direction; announcing a commit the user did not make is the bug this hook
+  # exists to avoid.
   case "$NEW_REPOS" in
     *$'\n'"$gitdir"$'\n'*)
-      moved=$(head_moved_at "$gitdir")
-      # Bounded on both sides: a future-dated HEAD would otherwise stay
-      # eligible for as long as its date says, which is the same trap the
-      # committer-date guard below fell into.
-      if ! [[ "$moved" =~ ^[0-9]+$ ]] \
-         || (( moved < NOW - NEW_REPO_WINDOW || moved > NOW + NEW_REPO_WINDOW )); then
-        echo "$candidate" >> "$SEEN_FILE"
-        continue
-      fi
+      echo "$candidate" >> "$SEEN_FILE"
+      continue
       ;;
   esac
   # New to us, but is it new at all? `git checkout other-branch` and

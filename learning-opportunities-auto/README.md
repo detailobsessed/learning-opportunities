@@ -1,12 +1,14 @@
 # learning-opportunities-auto
 
-A companion plugin for [learning-opportunities](../learning-opportunities/) that automatically detects good moments to offer learning exercises. Instead of relying on Claude to notice opportunities on its own, this plugin uses a `PostToolUse` hook to watch for significant code changes and nudge Claude to make the offer.
+A companion plugin for [learning-opportunities](../learning-opportunities/) that automatically detects good moments to offer learning exercises. Instead of relying on Claude to notice opportunities on its own, this plugin watches for commits and nudges Claude to make the offer.
 
 **Requires:** The `learning-opportunities` plugin must also be installed.
 
 ## How It Works
 
-The hook fires after every `Bash` tool use and checks whether the command was a `git commit` or a `jj commit` ([Jujutsu](https://github.com/jj-vcs/jj), which in its default colocated mode writes real commits to the underlying `.git` directory). After a successful commit, it nudges Claude to consider whether the work that was just committed is a good fit for a learning exercise — the `learning-opportunities` skill handles deciding what kind of exercise to offer based on the nature of the changes.
+It does not read the command. One script runs on three events: `SessionStart` and `PreToolUse` record where `HEAD` is in the repositories in play, and `PostToolUse` — which fires *after* the tool ran — asks whether `HEAD` has moved onto a commit that is new, that `HEAD`'s reflog does not attribute to a checkout, reset or fast-forward, and whose committer date falls inside the session. So a commit counts however it was spelled: behind an `env` prefix, through an alias or a shell function, from inside a script that never mentions git, or by [Jujutsu](https://github.com/jj-vcs/jj) in its default colocated mode, which writes real commits to the underlying `.git`. A command that only *mentions* committing moves nothing and says nothing.
+
+When a commit is found, it nudges Claude to consider whether the work is a good fit for a learning exercise — the `learning-opportunities` skill decides what kind to offer based on the nature of the changes.
 
 It respects the same session limits as the skill: no more than 2 offers per session, and it stops if the user declines.
 
